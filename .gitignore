@@ -1,0 +1,25 @@
+# 忽略所有 PyTorch 权重和检查点
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# 忽略离线推理结果和临时生成的三维点云资产
+results/
+*.ply
+*.png
+*.npy
+
+# 忽略本地开发环境和缓存
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.conda/
+.cache/
+
+# 屏蔽所有网页端运行时自动生成的 session 缓存文件夹
+panovggt_session_*/
+*.npz
+*.glb
+*.gltf
