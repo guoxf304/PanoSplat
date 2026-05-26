@@ -67,10 +67,10 @@ class Aggregator(nn.Module):
         # 1) DINO patch embedding
         self._build_patch_embed(
             patch_embed=patch_embed,
-            img_size=img_size,
-            patch_size=patch_size,
-            num_register_tokens=num_register_tokens,
-            embed_dim=embed_dim,
+            img_size=img_size, # 518
+            patch_size=patch_size, # 14
+            num_register_tokens=num_register_tokens, # 5
+            embed_dim=embed_dim, # 1024
         )
 
         # 2) RoPE (relative position encoding within attention)
@@ -78,12 +78,12 @@ class Aggregator(nn.Module):
         self.position_getter = PositionGetter() if self.rope is not None else None
 
         # 3) Absolute spherical position encoding (additive)
-        self.use_pano_pos = use_pano_pos
+        self.use_pano_pos = use_pano_pos # True
         if self.use_pano_pos:
             self.pano_pos_mlp = nn.Sequential(
-                nn.Linear(4, pos_mlp_hidden),
+                nn.Linear(4, pos_mlp_hidden), # 4: sin(theta), cos(theta), sin(phi), cos(phi)
                 nn.GELU(),
-                nn.Linear(pos_mlp_hidden, self.dec_embed_dim),
+                nn.Linear(pos_mlp_hidden, self.dec_embed_dim), # 1024
             )
             self.alpha_pos = nn.Parameter(torch.tensor(0.0))
 
@@ -105,7 +105,7 @@ class Aggregator(nn.Module):
                 attn_class=FlashAttentionRope,
                 rope=self.rope,
             )
-            for _ in range(depth)
+            for _ in range(depth) # 24
         ])
 
         # 5) Register tokens and normalization buffers
@@ -239,25 +239,25 @@ class Aggregator(nn.Module):
     #                           Decode                                     #
     # ------------------------------------------------------------------ #
     def _decode(self, hidden: torch.Tensor, B: int, S: int, H: int, W: int):
-        BN, hw, C = hidden.shape
+        BN, hw, C = hidden.shape # B*S,2738,1024
         assert BN == B * S
-        Hp, Wp = H // self.patch_size, W // self.patch_size
-        assert hw == Hp * Wp
+        Hp, Wp = H // self.patch_size, W // self.patch_size # 37，74
+        assert hw == Hp * Wp # 2738
 
         # Prepend register tokens
-        reg = self.register_token.repeat(B, S, 1, 1).reshape(B * S, self.patch_start_idx, C)
+        reg = self.register_token.repeat(B, S, 1, 1).reshape(B * S, self.patch_start_idx, C) # (B*S, 5, 1024)
         hidden = torch.cat([reg, hidden], dim=1)  # (B*S, P, C)
-        P = hidden.shape[1]
+        P = hidden.shape[1] # 2738+5=2743
 
         # --- RoPE position indices ---
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, Hp, Wp, device=hidden.device)
+            pos = self.position_ getter(B * S, Hp, Wp, device=hidden.device) # (B*S, 2738, 2)
             pos = pos + 1
             pos_special = torch.zeros(
                 B * S, self.patch_start_idx, 2,
                 device=hidden.device, dtype=pos.dtype,
-            )
+            ) # 寄存器的位置是 0
             pos = torch.cat([pos_special, pos], dim=1)
 
         # --- Absolute spherical position encoding ---
@@ -265,29 +265,29 @@ class Aggregator(nn.Module):
         pos_embed_multi_bsp = None
         if self.use_pano_pos:
             device = hidden.device
-            ys = torch.arange(Hp, device=device, dtype=torch.float32) + 0.5
-            xs = torch.arange(Wp, device=device, dtype=torch.float32) + 0.5
-            theta = (ys[:, None] / Hp - 0.5) * math.pi
-            phi = (xs[None, :] / Wp - 0.5) * (2 * math.pi)
+            ys = torch.arange(Hp, device=device, dtype=torch.float32) + 0.5 # (37,)
+            xs = torch.arange(Wp, device=device, dtype=torch.float32) + 0.5 # (74,)
+            theta = (ys[:, None] / Hp - 0.5) * math.pi # (37, 74)
+            phi = (xs[None, :] / Wp - 0.5) * (2 * math.pi) # (37, 74)
             theta = theta.expand(Hp, Wp)
-            phi = phi.expand(Hp, Wp)
+            phi = phi.expand(Hp, Wp) # (37, 74)
 
             pos_feats = torch.stack(
-                [torch.sin(theta), torch.cos(theta), torch.sin(phi), torch.cos(phi)],
+                [torch.sin(theta), torch.cos(theta), torch.sin(phi), torch.cos(phi)], # (37*74, 4)
                 dim=-1,
             ).reshape(Hp * Wp, 4)
 
-            pos_embed_patch = self.pano_pos_mlp(pos_feats)
+            pos_embed_patch = self.pano_pos_mlp(pos_feats) # (2738, 1024)，通过一个MLP得到位置编码
 
             # Register tokens get zero positional encoding
-            zeros_reg = torch.zeros(self.patch_start_idx, C, device=device, dtype=hidden.dtype)
-            pos_embed_single = torch.cat([zeros_reg, pos_embed_patch], dim=0)  # (P, C)
+            zeros_reg = torch.zeros(self.patch_start_idx, C, device=device, dtype=hidden.dtype) # (5, 1024)
+            pos_embed_single = torch.cat([zeros_reg, pos_embed_patch], dim=0)  # (P, C) # (2743, 1024)
 
-            pos_embed_single_bs = pos_embed_single.unsqueeze(0).expand(B * S, -1, -1)
+            pos_embed_single_bs = pos_embed_single.unsqueeze(0).expand(B * S, -1, -1) # (B*S, 2743, 1024)
             pos_embed_multi_bsp = (
                 pos_embed_single.unsqueeze(0).unsqueeze(0)
                 .expand(B, S, P, C)
-                .reshape(B, S * P, C)
+                .reshape(B, S * P, C) # (B, S*P, 1024)
             )
 
         # --- Decoder loop ---
@@ -295,31 +295,31 @@ class Aggregator(nn.Module):
         for i, blk in enumerate(self.decoder):
             if i % 2 == 0:
                 # Single-frame branch
-                h_in = hidden.reshape(B * S, P, C)
+                h_in = hidden.reshape(B * S, P, C) # (B*S, 2743, 1024)
                 if self.use_pano_pos:
-                    h_in = h_in + self.alpha_pos * pos_embed_single_bs
-                p_in = None if pos is None else pos.reshape(B * S, P, -1)
+                    h_in = h_in + self.alpha_pos * pos_embed_single_bs # 绝对球面位置编码乘以一个可训练的参数
+                p_in = None if pos is None else pos.reshape(B * S, P, -1) # (B*S, 2743, 2)
             else:
                 # Multi-frame branch
-                h_in = hidden.reshape(B, S * P, C)
+                h_in = hidden.reshape(B, S * P, C) # (B, S*P, 1024)
                 if self.use_pano_pos:
-                    h_in = h_in + self.alpha_pos * pos_embed_multi_bsp
-                p_in = None if pos is None else pos.reshape(B, S * P, -1)
+                    h_in = h_in + self.alpha_pos * pos_embed_multi_bsp # 绝对球面位置编码乘以一个可训练的参数
+                p_in = None if pos is None else pos.reshape(B, S * P, -1) # (B, S*P, 2)
 
             if self.training and self.use_checkpoint and i >= self.num_dec_blk_not_to_checkpoint:
-                h_out = checkpoint(blk, h_in, p_in, use_reentrant=False)
+                h_out = checkpoint(blk, h_in, p_in, use_reentrant=False) # 使用梯度检查点技术
             else:
                 h_out = blk(h_in, xpos=p_in)
 
-            hidden = h_out.reshape(B * S, P, C)
+            hidden = h_out.reshape(B * S, P, C) # (B*S, 2743, 1024)
 
             if i + 1 in [self.depth - 1, self.depth]:
-                last_two.append(hidden)
+                last_two.append(hidden) # 最后两层特征
 
-        last_two_cat = torch.cat(last_two, dim=-1) if len(last_two) == 2 else last_two[-1]
+        last_two_cat = torch.cat(last_two, dim=-1) if len(last_two) == 2 else last_two[-1] # (B*S, 2743, 2048)
 
-        pos_2d = None if pos is None else pos.reshape(B * S, P, -1)
-        return last_two_cat, pos_2d
+        pos_2d = None if pos is None else pos.reshape(B * S, P, -1) # (B*S, 2743, 2)
+        return last_two_cat, pos_2d # (B*S, 2743, 2048), (B*S, 2743, 2)
 
     # ------------------------------------------------------------------ #
     #                           Forward                                    #
@@ -341,11 +341,11 @@ class Aggregator(nn.Module):
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
         # Normalize
-        images = (images - self._resnet_mean) / self._resnet_std
+        images = (images - self._resnet_mean) / self._resnet_std # 归一化
 
         # Patch embed
-        x = images.view(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(x)
+        x = images.view(B * S, C_in, H, W) # (B*S, 3, 518, 1036)
+        patch_tokens = self.patch_embed(x) # (B*S, 2738, 1024)
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
         if getattr(self, "needs_projection", False):
@@ -354,7 +354,7 @@ class Aggregator(nn.Module):
         # Decode
         hidden_cat, pos_2d = self._decode(patch_tokens, B, S, H, W)
 
-        P = hidden_cat.shape[1]
-        C2 = hidden_cat.shape[-1]
-        output = hidden_cat.view(B, S, P, C2)
-        return [output], self.patch_start_idx, pos_2d
+        P = hidden_cat.shape[1] # 2743
+        C2 = hidden_cat.shape[-1] # 2048
+        output = hidden_cat.view(B, S, P, C2) # (B, S, 2743, 2048)
+        return [output], self.patch_start_idx, pos_2d # (B, S, 2743, 2048), 5, (B*S, 2743, 2)

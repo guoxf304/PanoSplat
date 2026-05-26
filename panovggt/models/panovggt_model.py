@@ -147,7 +147,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         )
         self.patch_size = patch_size
 
-        # 2) Branch switches
+        # 2) Branch switches 可选任务头开关
         self.enable_camera = enable_camera
         self.enable_point = enable_point
         self.enable_depth = enable_depth
@@ -278,7 +278,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         if images.dim() == 4:
             images = images.unsqueeze(0)
-        B, S, _, H, W = images.shape
+        B, S, _, H, W = images.shape # shape: (B, S, C, H, W)
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
         # Aggregator forward
@@ -291,7 +291,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             patch_start_idx = 0
 
         if tokens.dim() == 4:
-            tokens = tokens.view(B * S, tokens.shape[2], tokens.shape[3])
+            tokens = tokens.view(B * S, tokens.shape[2], tokens.shape[3]) # (B*S, 2743, 2048)
 
         # RoPE position indices
         pos_2d = None
@@ -301,7 +301,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             pos_special = torch.zeros(
                 B * S, patch_start_idx, 2, device=tokens.device, dtype=pos_2d.dtype
             )
-            pos_2d = torch.cat([pos_special, pos_2d], dim=1)
+            pos_2d = torch.cat([pos_special, pos_2d], dim=1) # (B*S, 2738+5, 2)
 
         predictions = {}
 
