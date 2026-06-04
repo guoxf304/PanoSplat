@@ -25,6 +25,9 @@ kornia
 
 hydra-core
 omegaconf
+iopath
+fvcore
+wcmatch
 
 yacs
 
@@ -34,6 +37,9 @@ huggingface-hub
 safetensors
 
 xformers
+
+# Optional: panoramic 3DGS training (install from ODGS repo)
+# pip install -e /path/to/ODGS/submodules/odgs-gaussian-rasterization
 
 # Web / UI
 gradio==5.17.1

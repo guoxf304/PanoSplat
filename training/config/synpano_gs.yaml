@@ -1,0 +1,133 @@
+# @package _global_
+# SynPano smoke / fine-tune config for PanoVGGT + 3DGS (ODGS).
+# Data root: datasets/SynPano  (scene example: s_apartment)
+
+defaults:
+  - panovggt_gs
+  - _self_
+
+exp_name: synpano_gs_0603_1707
+
+SynPano_DIR: /mnt/gxf/PanoSplat/datasets/SynPano
+
+# 24GB GPU @ 518×1036: batch_size = max_img_per_gpu / fix_img_num (2 views per sample).
+img_size: 518
+max_img_per_gpu: 8
+max_img_per_gpu_val: 8
+num_workers: 4
+accum_steps: 1
+max_epochs: 50
+limit_train_batches: null
+limit_val_batches: null
+val_epoch_freq: 1
+
+logging:
+  log_dir: ./logs
+  log_visuals: false
+  log_freq: 1
+  # TensorBoard: per-step flush for live curves (tensorboard --logdir ./logs/tensorboard)
+  tensorboard_flush_each_step: true
+  tensorboard_log_grad: true
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard/${exp_name}
+    # SummaryWriter background flush interval (seconds)
+    flush_secs: 30
+  visual_export:
+    enabled: true
+    output_root: ./output/${exp_name}
+    every_epoch: true
+    # null / all / -1: export every batch in the epoch dataloader
+    num_batches: 5
+    render_all_views: true
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_rgb
+        - loss_depth_consis
+        - loss_camera
+        - loss_global_point
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_rgb
+        - loss_depth_consis
+        - loss_camera
+        - loss_global_point
+
+checkpoint:
+  save_dir: ./logs/${exp_name}/ckpts
+  save_freq: 10
+  resume_checkpoint_path: checkpoints/model.pt
+  strict: false
+
+model:
+  gs_stride: 1
+  gs_means_mode: anchor
+  gs_voxelize: true
+  gs_voxel_size: 0.02
+  gs_scale_max: 0.05  # max Gaussian axis radius (m); 5 cm cap
+  # gs_debug_forward: true
+  # gs_debug_every: 1
+  # Gradient debug: export PANOSPLAT_GS_GRAD_DEBUG=1
+  # Core every step: param_grads summary + cloud.* [backward] max_abs
+  # Verbose every 50 steps: gs_raw channels, cloud before/after, trace.* (override: PANOSPLAT_GS_GRAD_VERBOSE_EVERY=100)
+  # gs_grad_debug_forward: true
+
+loss:
+  lambda_geo: 0.0
+  lambda_dssim: 0.4
+  lambda_depth_consis: 0.01
+  render_views_per_step: 1
+  use_gt_pose: true
+  # Cross-view axis test before render_erp: none | flip_yz (try A) | flip_xz (try B)
+  # Override at runtime: export PANOSPLAT_GS_AXIS_ALIGN=flip_yz
+  gs_cross_view_axis_align: null
+
+data:
+  train:
+    common_config:
+      img_nums: [2, 2]
+      fix_img_num: 2
+      get_nearby: true
+      augs:
+        color_aug: true
+        aspects: [0.5, 1.0]
+        pitch:
+          sample_angle: 10.0
+        yaw:
+          sample_angle: 30.0
+        roll:
+          sample_angle: 10.0
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.synpano.SynPanoDataset
+          split: train
+          SynPano_DIR: ${SynPano_DIR}
+          scene_names: ['apartment']
+          len_train: 1200
+          get_nearby: true
+          depth_max: 50.0
+
+  val:
+    drop_last: True
+    shuffle: False
+    common_config:
+      img_nums: [2, 2]
+      fix_img_num: 2
+      training: false
+      augs:
+        color_aug: false
+        aspects: [0.5, 1.0]
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.synpano.SynPanoDataset
+          split: test
+          SynPano_DIR: ${SynPano_DIR}
+          scene_names: null
+          len_test: 20
+          get_nearby: false
+          depth_max: 50.0

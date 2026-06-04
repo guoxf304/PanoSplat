@@ -87,9 +87,12 @@ logging:
   log_level_primary: DEBUG
   log_level_secondary: WARNING
   all_ranks: True
+  tensorboard_flush_each_step: true
+  tensorboard_log_grad: true
   tensorboard_writer:
     _target_: train_utils.tb_writer.TensorBoardLogger
     path: ${logging.log_dir}/tensorboard/${exp_name}
+    flush_secs: 30
   scalar_keys_to_log:
     train:
       keys_to_log:

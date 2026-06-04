@@ -90,18 +90,10 @@ class PanoAugmentation:
         """
         self.training = training
 
-        # --- Sample random parameters for color/gamma ONCE ---
-        self.gamma = None
+        # --- Sample random parameters for color jitter ONCE ---
         self.color_jitter_params = None
 
         if self.training and aug_config:
-            # Sample Gamma Correction
-            if 'rand_gamma' in aug_config and random.random() > 0.5:
-                gamma_range = aug_config['rand_gamma']
-                gamma = random.uniform(gamma_range.get('min', 0.8), gamma_range.get('max', 1.2))
-                self.gamma = 1.0 / gamma if random.random() < 0.5 else gamma
-
-            # Sample Color Jitter Parameters
             if aug_config.get('color_aug', False) and random.random() > 0.5:
                 b, c, s, h = 0.4, 0.4, 0.4, 0.1
                 order = list(range(4))
@@ -142,10 +134,5 @@ class PanoAugmentation:
                     elif op == 3:
                         img = F.adjust_hue(img, params['hue_factor'])
                 images_tensor[i] = img
-
-        # Apply Gamma Correction to the whole batch
-        if self.gamma is not None:
-            for i in range(len(images_tensor)):
-                images_tensor[i] = F.adjust_gamma(images_tensor[i], self.gamma)
 
         return [torch.clamp(img, 0.0, 1.0) for img in images_tensor]

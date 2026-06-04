@@ -1,0 +1,62 @@
+# @package _global_
+defaults:
+  - default
+
+exp_name: panovggt_gs
+
+model:
+  _target_: panovggt.models.panovggt_gs_model.PanoVGGTGSModel
+  enable_gaussian: true
+  enable_camera: true
+  enable_point: true
+  enable_depth: true
+  enable_global_points: true
+  gs_sh_degree: 0
+  gs_stride: 2
+  gs_means_mode: anchor
+  gs_voxelize: true
+  gs_voxel_size: 0.02
+  gs_scale_max: 0.05
+  gs_view_type: erp
+  gs_detach_means: false
+  gs_dpt_features: 256
+  # GS debug: print tensor shapes on rank0. Or: export PANOSPLAT_GS_DEBUG=1
+  gs_debug_forward: false
+  gs_debug_every: 1
+
+loss:
+  _target_: panovggt.models.loss_gs.GSLoss
+  train_conf: false
+  lambda_rgb: 1.0
+  # Geometry heads are frozen during GS stage; keep 0 so loss_objective only backprops via render.
+  lambda_geo: 0.0
+  lambda_dssim: 0.4
+  lambda_depth_consis: 0.01
+  render_views_per_step: 2
+  use_gt_pose: false
+  gs_cross_view_axis_align: none
+  background_color: [0.0, 0.0, 0.0]
+
+optim:
+  frozen_module_names:
+    - aggregator
+    - pos_adapters
+    - point_decoder
+    - camera_decoder
+    - global_points_decoder
+    - point_head
+    - camera_head
+    - global_point_head
+
+  # Trainable: gaussian_param_head only (pos_adapters frozen with geometry heads).
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["gaussian_param_head"]
+        max_norm: 1.0
+        norm_type: 2
+
+distributed:
+  find_unused_parameters: true
+
+max_epochs: 30

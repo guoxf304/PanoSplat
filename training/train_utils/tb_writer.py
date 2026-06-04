@@ -82,31 +82,39 @@ class TensorBoardLogger:
             self._writer.close()
             self._writer = None
 
-    def log_dict(self, payload: Dict[str, Any], step: int) -> None:
+    def log_dict(
+        self, payload: Dict[str, Any], step: int, flush: bool = True
+    ) -> None:
         """Log multiple scalar values to TensorBoard.
 
         Args:
             payload: Dictionary mapping tag names to scalar values
             step: Step value to record
+            flush: Flush after all scalars are written (default True)
         """
         if not self._writer:
             return
 
         for key, value in payload.items():
-            self.log(key, value, step)
+            self.log(key, value, step, flush=False)
+        if flush:
+            self.flush()
 
-    def log(self, name: str, data: Any, step: int) -> None:
+    def log(self, name: str, data: Any, step: int, flush: bool = False) -> None:
         """Log scalar data to TensorBoard.
 
         Args:
             name: Tag name used to group scalars
             data: Scalar data to log (float/int/Tensor)
             step: Step value to record
+            flush: If True, flush the writer immediately (for live dashboards)
         """
         if not self._writer:
             return
 
         self._writer.add_scalar(name, data, global_step=step, new_style=True)
+        if flush:
+            self.flush()
 
     def log_visuals(
         self,

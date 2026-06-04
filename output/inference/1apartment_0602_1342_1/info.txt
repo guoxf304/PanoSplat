@@ -1,0 +1,10 @@
+images: 1
+anchor_view: 0
+gs_means_mode: merged
+num_gaussians: 536648
+geometry_per_frame_ply: 1
+geometry_merged_points: 536648
+geometry_ply_dir: output/inference/1apartment_0602_1342_1/pointclouds
+gaussian_ply: output/inference/1apartment_0602_1342_1/gaussians/gaussians.ply
+resolution: 518x1036
+  [0] examples/1apartment/0096.png

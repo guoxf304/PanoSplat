@@ -1,0 +1,66 @@
+epoch: 2
+global_step: 600
+num_export_batches: 5
+num_rendered_views: 40
+
+[epoch_train_loss_avg]
+  loss_objective: 0.241307
+  loss_rgb: 0.215019
+  loss_depth_consis: 2.628790
+  loss_camera: 0.000000
+  loss_global_point: 0.000000
+
+[infer_batch_loss_avg]
+  loss_rgb: 0.054233
+  loss_depth_consis: 2.173693
+  loss_objective: 0.075970
+  loss_camera: 0.000000
+  loss_global_point: 0.000000
+
+[render_quality_avg]
+  l1: 0.123616
+  psnr: 21.4215
+  ssim: 0.638998
+  lpips: nan
+
+[per_view_metrics]
+  view_000: l1=0.272447 psnr=11.6926 ssim=0.324428 lpips=nan
+  view_001: l1=0.015436 psnr=31.9245 ssim=0.932137 lpips=nan
+  view_002: l1=0.225448 psnr=12.9035 ssim=0.404724 lpips=nan
+  view_003: l1=0.025297 psnr=28.0171 ssim=0.864730 lpips=nan
+  view_004: l1=0.407438 psnr=8.6280 ssim=0.095855 lpips=nan
+  view_005: l1=0.022351 psnr=30.1576 ssim=0.935440 lpips=nan
+  view_006: l1=0.144702 psnr=15.9973 ssim=0.523907 lpips=nan
+  view_007: l1=0.016789 psnr=30.3477 ssim=0.904929 lpips=nan
+  view_008: l1=0.154802 psnr=15.4731 ssim=0.511274 lpips=nan
+  view_009: l1=0.018106 psnr=29.8493 ssim=0.891618 lpips=nan
+  view_010: l1=0.288526 psnr=10.7414 ssim=0.235892 lpips=nan
+  view_011: l1=0.019040 psnr=28.8721 ssim=0.902881 lpips=nan
+  view_012: l1=0.234709 psnr=12.4148 ssim=0.381200 lpips=nan
+  view_013: l1=0.021624 psnr=28.5816 ssim=0.854386 lpips=nan
+  view_014: l1=0.077375 psnr=19.3841 ssim=0.676500 lpips=nan
+  view_015: l1=0.012750 psnr=32.5906 ssim=0.936199 lpips=nan
+  view_016: l1=0.280424 psnr=11.3691 ssim=0.228963 lpips=nan
+  view_017: l1=0.025569 psnr=27.9406 ssim=0.867071 lpips=nan
+  view_018: l1=0.175560 psnr=14.6687 ssim=0.452327 lpips=nan
+  view_019: l1=0.018143 psnr=30.1168 ssim=0.912147 lpips=nan
+  view_020: l1=0.233468 psnr=12.6230 ssim=0.408762 lpips=nan
+  view_021: l1=0.026127 psnr=27.7151 ssim=0.863151 lpips=nan
+  view_022: l1=0.230519 psnr=12.6549 ssim=0.429729 lpips=nan
+  view_023: l1=0.016973 psnr=30.8807 ssim=0.928355 lpips=nan
+  view_024: l1=0.397321 psnr=8.9496 ssim=0.033976 lpips=nan
+  view_025: l1=0.014362 psnr=32.7930 ssim=0.940582 lpips=nan
+  view_026: l1=0.225646 psnr=12.8990 ssim=0.387886 lpips=nan
+  view_027: l1=0.026392 psnr=27.7459 ssim=0.847182 lpips=nan
+  view_028: l1=0.325174 psnr=10.4191 ssim=0.157006 lpips=nan
+  view_029: l1=0.028096 psnr=27.2918 ssim=0.862062 lpips=nan
+  view_030: l1=0.169254 psnr=14.8106 ssim=0.501278 lpips=nan
+  view_031: l1=0.015158 psnr=30.9937 ssim=0.926798 lpips=nan
+  view_032: l1=0.224567 psnr=12.8845 ssim=0.393801 lpips=nan
+  view_033: l1=0.026161 psnr=27.8130 ssim=0.844076 lpips=nan
+  view_034: l1=0.169142 psnr=14.6880 ssim=0.469714 lpips=nan
+  view_035: l1=0.024141 psnr=27.8545 ssim=0.847737 lpips=nan
+  view_036: l1=0.120003 psnr=16.8970 ssim=0.629301 lpips=nan
+  view_037: l1=0.018742 psnr=30.4146 ssim=0.919627 lpips=nan
+  view_038: l1=0.179037 psnr=14.5033 ssim=0.411429 lpips=nan
+  view_039: l1=0.017821 psnr=30.3599 ssim=0.920848 lpips=nan

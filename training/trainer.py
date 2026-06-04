@@ -35,6 +35,14 @@ from train_utils.normalization import normalize_camera_extrinsics_and_points_bat
 from train_utils.optimizer import construct_optimizers
 
 
+def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
 def _safe_barrier(local_rank: int):
     """A safe barrier with explicit device binding when NCCL supports it."""
     if not dist.is_available() or not dist.is_initialized():
@@ -343,15 +351,70 @@ class Trainer:
             return self.logging_conf.scalar_keys_to_log[phase].keys_to_log
         return []
 
+    def _tb_flush_each_step(self) -> bool:
+        return bool(getattr(self.logging_conf, "tensorboard_flush_each_step", True))
+
+    def _tb_log_grad(self) -> bool:
+        return bool(getattr(self.logging_conf, "tensorboard_log_grad", True))
+
+    def _log_tensorboard_scalars(
+        self,
+        phase: str,
+        step: int,
+        *,
+        loss_dict: Optional[Mapping[str, Any]] = None,
+        loss_meters: Optional[Dict[str, AverageMeter]] = None,
+    ) -> None:
+        """Write per-step losses and running meter averages to TensorBoard (rank 0)."""
+        if self.rank != 0 or step % self.logging_conf.log_freq != 0:
+            return
+
+        flush = self._tb_flush_each_step()
+        payload: Dict[str, float] = {}
+
+        if loss_dict is not None:
+            for key in self._get_scalar_log_keys(phase):
+                if key not in loss_dict:
+                    continue
+                val = loss_dict[key]
+                if torch.is_tensor(val):
+                    val = val.detach().float().item()
+                payload[f"Loss/{phase}/step/{key}"] = float(val)
+
+        if loss_meters is not None:
+            prefix = f"Loss/{phase}_"
+            for name, meter in loss_meters.items():
+                if name.startswith(prefix):
+                    metric = name[len(prefix) :]
+                    payload[f"Loss/{phase}/avg/{metric}"] = float(meter.avg)
+                elif self._tb_log_grad() and name.startswith("Grad/"):
+                    grad_key = name[len("Grad/") :]
+                    payload[f"Grad/{phase}/{grad_key}"] = float(meter.val)
+                    payload[f"Grad/{phase}/{grad_key}_avg"] = float(meter.avg)
+
+        payload[f"{phase}/epoch"] = float(self.epoch)
+        if payload:
+            self.tb_writer.log_dict(payload, step, flush=flush)
+
     def run(self):
         assert self.mode in ["train", "val"], f"Invalid mode: {self.mode}"
-        if self.mode == "train":
-            self.run_train()
-            self.run_val()
-        elif self.mode == "val":
-            self.run_val()
-        else:
-            raise ValueError(f"Invalid mode: {self.mode}")
+        try:
+            if self.mode == "train":
+                self.run_train()
+                logging.info(
+                    "Training finished after %s epochs (last logged epoch=%s).",
+                    self.max_epochs,
+                    self.epoch,
+                )
+                self.run_val()
+                self._maybe_export_erp_visuals()
+            elif self.mode == "val":
+                self.run_val()
+            else:
+                raise ValueError(f"Invalid mode: {self.mode}")
+        finally:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
 
     def run_train(self):
         while self.epoch < self.max_epochs:
@@ -360,6 +423,7 @@ class Trainer:
 
             final_train_loss_meters = self.train_epoch(dataloader)
             self._log_epoch_metrics(final_train_loss_meters, 'train', self.epoch)
+            self._maybe_export_epoch_train_inference(final_train_loss_meters)
             self.save_checkpoint(self.epoch)
 
             del dataloader, final_train_loss_meters
@@ -374,6 +438,52 @@ class Trainer:
 
         self.epoch -= 1
 
+    def _maybe_run_gaussian_audit(self) -> None:
+        """Rank-0 Gaussian scale/opacity/aspect audit after val (GS models only)."""
+        if self.rank != 0:
+            _safe_barrier(self.local_rank)
+            return
+        from train_utils.gs_gaussian_auditor import export_epoch_gaussian_audit
+
+        export_epoch_gaussian_audit(self, phase="val")
+        _safe_barrier(self.local_rank)
+
+    def _maybe_export_epoch_train_inference(
+        self, final_train_loss_meters: Dict[str, AverageMeter]
+    ) -> None:
+        """Rank-0 per-epoch GS inference on train batches (logging.visual_export)."""
+        ve = getattr(self.logging_conf, "visual_export", None)
+        if ve is None or not _cfg_get(ve, "enabled", False):
+            return
+        if not _cfg_get(ve, "every_epoch", True):
+            return
+        if self.rank != 0:
+            _safe_barrier(self.local_rank)
+            return
+        from train_utils.gs_epoch_infer import export_epoch_train_inference
+
+        export_epoch_train_inference(self, final_train_loss_meters)
+        _safe_barrier(self.local_rank)
+
+    def _maybe_export_erp_visuals(self) -> None:
+        """Rank-0 ERP PNG export after training (legacy val-only export)."""
+        ve = getattr(self.logging_conf, "visual_export", None)
+        if ve is None or not _cfg_get(ve, "enabled", False):
+            return
+        if _cfg_get(ve, "every_epoch", True):
+            return
+        if self.rank != 0:
+            _safe_barrier(self.local_rank)
+            return
+        from train_utils.gs_visual_export import export_erp_visual_comparison
+
+        export_erp_visual_comparison(
+            self,
+            output_dir=str(_cfg_get(ve, "output_dir", "./output/visual_comparison")),
+            num_samples=int(_cfg_get(ve, "num_samples", 5)),
+        )
+        _safe_barrier(self.local_rank)
+
     def run_val(self):
         if not self.val_dataset:
             logging.info("No validation dataset configured. Skipping validation.")
@@ -382,6 +492,7 @@ class Trainer:
         dataloader = self.val_dataset.get_loader(epoch=self.epoch)
         final_val_loss_meters = self.val_epoch(dataloader)
         self._log_epoch_metrics(final_val_loss_meters, 'val', self.epoch)
+        self._maybe_run_gaussian_audit()
 
         del dataloader, final_val_loss_meters
         gc.collect()
@@ -471,6 +582,7 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+        _safe_barrier(self.local_rank)
         return loss_meters
 
     def train_epoch(self, train_loader):
@@ -540,7 +652,7 @@ class Trainer:
             accum_steps = self.accum_steps
             chunked_batches = [batch] if accum_steps == 1 else chunk_batch_for_accum_steps(batch, accum_steps)
 
-            self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
+            stepped = self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
 
             # step schedulers
             exact_epoch = self.epoch + float(data_iter) / limit_train_batches
@@ -559,22 +671,60 @@ class Trainer:
                         for option in optim.schedulers[j]:
                             optim_prefix = (f"{i}_" if len(self.optims) > 1
                                             else (f"{j}_" if len(optim.optimizer.param_groups) > 1 else ""))
-                            self.tb_writer.log(os.path.join("Optim", f"{optim_prefix}", option),
-                                               param_group[option], self.steps[phase])
-                self.tb_writer.log(os.path.join("Optim", "where"), self.where, self.steps[phase])
+                            self.tb_writer.log(
+                                os.path.join("Optim", f"{optim_prefix}", option),
+                                param_group[option],
+                                self.steps[phase],
+                                flush=False,
+                            )
+                self.tb_writer.log(
+                    os.path.join("Optim", "where"),
+                    self.where,
+                    self.steps[phase],
+                    flush=self._tb_flush_each_step(),
+                )
 
-            # Grad clipping / nan guard
-            if self.gradient_clipper is not None:
+            if stepped:
+                # Grad clipping / nan guard
+                if self.gradient_clipper is not None:
+                    for optim in self.optims:
+                        self.scaler.unscale_(optim.optimizer)
+                    try:
+                        from panovggt.utils.gs_debug import (
+                            is_gs_grad_debug_enabled,
+                            report_after_backward,
+                        )
+
+                        if is_gs_grad_debug_enabled():
+                            cache = getattr(self, "_gs_debug_last", None)
+                            if cache is not None:
+                                y_hat_dbg, loss_dict_dbg = cache
+                                report_after_backward(
+                                    self.model,
+                                    y_hat_dbg,
+                                    loss_dict_dbg,
+                                    step=self.steps[phase],
+                                )
+                    except Exception as exc:
+                        logging.warning("GS grad debug failed: %s", exc)
+                    grad_norm_dict = self.gradient_clipper(model=self.model)
+                    for key, grad_norm in grad_norm_dict.items():
+                        loss_meters[f"Grad/{key}"].update(grad_norm)
+
+                # steps[phase] was incremented in _loss_and_log; align TB x-axis with step loss.
+                self._log_tensorboard_scalars(
+                    phase,
+                    max(0, self.steps[phase] - 1),
+                    loss_meters=loss_meters,
+                )
+
+                # Optim step
                 for optim in self.optims:
-                    self.scaler.unscale_(optim.optimizer)
-                grad_norm_dict = self.gradient_clipper(model=self.model)
-                for key, grad_norm in grad_norm_dict.items():
-                    loss_meters[f"Grad/{key}"].update(grad_norm)
-
-            # Optim step
-            for optim in self.optims:
-                self.scaler.step(optim.optimizer)
-            self.scaler.update()
+                    self.scaler.step(optim.optimizer)
+                self.scaler.update()
+            else:
+                for optim in self.optims:
+                    optim.zero_grad(set_to_none=True)
 
             batch_time.update(time.time() - end)
             end = time.time()
@@ -586,11 +736,15 @@ class Trainer:
 
         return loss_meters
 
-    def _run_steps_on_batch_chunks(self, chunked_batches: List[Any], phase: str, loss_meters: Dict[str, AverageMeter]):
+    def _run_steps_on_batch_chunks(
+        self, chunked_batches: List[Any], phase: str, loss_meters: Dict[str, AverageMeter]
+    ) -> bool:
+        """Returns False if backward was skipped (e.g. non-finite loss)."""
         for optim in self.optims:
             optim.zero_grad(set_to_none=True)
 
         accum_steps = len(chunked_batches)
+        did_backward = False
 
         amp_type = self.optim_conf.amp.amp_dtype
         assert amp_type in ["bfloat16", "float16"]
@@ -600,19 +754,27 @@ class Trainer:
             ddp_context = (self.model.no_sync() if i < accum_steps - 1 else contextlib.nullcontext())
             with ddp_context:
                 with torch.amp.autocast('cuda', enabled=self.optim_conf.amp.enabled, dtype=amp_dtype):
-                    loss_dict = self._step(chunked_batch, self.model, phase, loss_meters)
+                    y_hat = self._forward(chunked_batch, self.model, phase)
+                # ODGS rasterize + SSIM need fp32 autograd; frozen-geo terms have no trainable grad.
+                with torch.amp.autocast('cuda', enabled=False):
+                    loss_dict = self._loss_and_log(y_hat, chunked_batch, phase, loss_meters)
 
                 loss = loss_dict["loss_objective"]
                 loss_key = f"Loss/{phase}_loss_objective"
                 batch_size = chunked_batch["images"].shape[0]
 
                 if not math.isfinite(loss.item()):
-                    logging.error(f"Loss is {loss.item()}, stop training")
-                    return
+                    logging.error(
+                        f"Loss is {loss.item()} (non-finite); skipping backward for this batch."
+                    )
+                    continue
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
-                loss_meters[loss_key].update(loss.item(), batch_size)
+                did_backward = True
+                self._gs_debug_last = (y_hat, loss_dict)
+
+        return did_backward
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
         tensor_keys = ["images", "depths", "extrinsics", "intrinsics", "cam_points", "world_points", "point_masks"]
@@ -646,26 +808,47 @@ class Trainer:
         batch["norm_factors"] = avg_scale
         return batch
 
-    def _step(self, batch, model: nn.Module, phase: str, loss_meters: dict):
-        y_hat = model(images=batch["images"])
+    def _forward(self, batch, model: nn.Module, phase: str):
+        if hasattr(model, "set_global_step"):
+            model.set_global_step(self.steps[phase])
+        elif hasattr(model, "module") and hasattr(model.module, "set_global_step"):
+            model.module.set_global_step(self.steps[phase])
+        return model(images=batch["images"])
+
+    def _loss_and_log(self, y_hat, batch, phase: str, loss_meters: dict):
         loss_dict = self.loss(y_hat, batch)
-
         log_data = {**y_hat, **loss_dict, **batch}
-        self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
-        self._log_tb_visuals(log_data, phase, self.steps[phase])
-
+        step = self.steps[phase]
+        self._update_and_log_scalars(
+            log_data, phase, step, loss_meters, loss_dict=loss_dict
+        )
+        self._log_tb_visuals(log_data, phase, step)
         self.steps[phase] += 1
         return loss_dict
 
-    def _update_and_log_scalars(self, data: Mapping, phase: str, step: int, loss_meters: dict):
+    def _step(self, batch, model: nn.Module, phase: str, loss_meters: dict):
+        with torch.amp.autocast('cuda', enabled=False):
+            y_hat = self._forward(batch, model, phase)
+            return self._loss_and_log(y_hat, batch, phase, loss_meters)
+
+    def _update_and_log_scalars(
+        self,
+        data: Mapping,
+        phase: str,
+        step: int,
+        loss_meters: dict,
+        loss_dict: Optional[Mapping[str, Any]] = None,
+    ):
         keys_to_log = self._get_scalar_log_keys(phase)
         batch_size = data['extrinsics'].shape[0]
         for key in keys_to_log:
             if key in data:
                 value = data[key].item() if torch.is_tensor(data[key]) else data[key]
                 loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
-                if step % self.logging_conf.log_freq == 0 and self.rank == 0:
-                    self.tb_writer.log(f"Values/{phase}/{key}", value, step)
+        if loss_dict is not None:
+            self._log_tensorboard_scalars(
+                phase, step, loss_dict=loss_dict, loss_meters=None
+            )
 
     def _log_tb_visuals(self, batch: Mapping, phase: str, step: int) -> None:
         if not (

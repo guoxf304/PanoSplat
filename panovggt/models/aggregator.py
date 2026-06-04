@@ -63,6 +63,7 @@ class Aggregator(nn.Module):
         self.num_dec_blk_not_to_checkpoint = num_dec_blk_not_to_checkpoint
         self.use_checkpoint = use_checkpoint
         self.use_reentrant = False
+        self.hook_layer_indices = self._default_hook_indices(depth)
 
         # 1) DINO patch embedding
         self._build_patch_embed(
@@ -125,6 +126,19 @@ class Aggregator(nn.Module):
             torch.tensor(_RESNET_STD, dtype=torch.float32).view(1, 1, 3, 1, 1),
             persistent=False,
         )
+
+    @staticmethod
+    def _default_hook_indices(depth: int) -> List[int]:
+        """Decoder block indices (1-based) for multi-scale DPT hooks."""
+        if depth >= 36:
+            return [8, 18, 27, 35]
+        d = max(depth, 4)
+        return [
+            max(1, d // 4),
+            max(1, d // 2),
+            max(1, (3 * d) // 4),
+            d,
+        ]
 
     # ------------------------------------------------------------------ #
     #                        Patch Embedding                               #
@@ -252,7 +266,7 @@ class Aggregator(nn.Module):
         # --- RoPE position indices ---
         pos = None
         if self.rope is not None:
-            pos = self.position_ getter(B * S, Hp, Wp, device=hidden.device) # (B*S, 2738, 2)
+            pos = self.position_getter(B * S, Hp, Wp, device=hidden.device) # (B*S, 2738, 2)
             pos = pos + 1
             pos_special = torch.zeros(
                 B * S, self.patch_start_idx, 2,
@@ -292,6 +306,7 @@ class Aggregator(nn.Module):
 
         # --- Decoder loop ---
         last_two = []
+        hook_outputs = {}
         for i, blk in enumerate(self.decoder):
             if i % 2 == 0:
                 # Single-frame branch
@@ -313,26 +328,35 @@ class Aggregator(nn.Module):
 
             hidden = h_out.reshape(B * S, P, C) # (B*S, 2743, 1024)
 
-            if i + 1 in [self.depth - 1, self.depth]:
+            layer_idx = i + 1
+            if layer_idx in self.hook_layer_indices:
+                hook_outputs[layer_idx] = hidden
+
+            if layer_idx in [self.depth - 1, self.depth]:
                 last_two.append(hidden) # 最后两层特征
 
         last_two_cat = torch.cat(last_two, dim=-1) if len(last_two) == 2 else last_two[-1] # (B*S, 2743, 2048)
 
+        hook_list = [hook_outputs[idx] for idx in self.hook_layer_indices if idx in hook_outputs]
+        if len(hook_list) < len(self.hook_layer_indices):
+            hook_list = [hidden for _ in self.hook_layer_indices]
+
         pos_2d = None if pos is None else pos.reshape(B * S, P, -1) # (B*S, 2743, 2)
-        return last_two_cat, pos_2d # (B*S, 2743, 2048), (B*S, 2743, 2)
+        return hook_list, last_two_cat, pos_2d
 
     # ------------------------------------------------------------------ #
     #                           Forward                                    #
     # ------------------------------------------------------------------ #
     def forward(
         self, images: torch.Tensor
-    ) -> Tuple[List[torch.Tensor], int, Optional[torch.Tensor]]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], int, Optional[torch.Tensor]]:
         """
         Args:
             images: (B, S, 3, H, W) input panoramic images.
 
         Returns:
-            output_list: [(B, S, P, 2*C)] aggregated features.
+            hook_tokens_list: list of (B, S, P, C) multi-scale features.
+            output_list: [(B, S, P, 2*C)] final aggregated features.
             patch_start_idx: number of register tokens prepended.
             pos_2d: optional RoPE position embeddings.
         """
@@ -352,9 +376,18 @@ class Aggregator(nn.Module):
             patch_tokens = self.patch_embed_projection(patch_tokens)
 
         # Decode
-        hidden_cat, pos_2d = self._decode(patch_tokens, B, S, H, W)
+        hook_list, hidden_cat, pos_2d = self._decode(patch_tokens, B, S, H, W)
 
         P = hidden_cat.shape[1] # 2743
+        C = self.dec_embed_dim
         C2 = hidden_cat.shape[-1] # 2048
+        hook_tokens_list = []
+        for h in hook_list:
+            if h.shape[-1] != C:
+                raise RuntimeError(
+                    f"Hook token dim {h.shape[-1]} != dec_embed_dim {C}; "
+                    "expected per-layer hooks, not fused decoder tokens."
+                )
+            hook_tokens_list.append(h.view(B, S, P, C))
         output = hidden_cat.view(B, S, P, C2) # (B, S, 2743, 2048)
-        return [output], self.patch_start_idx, pos_2d # (B, S, 2743, 2048), 5, (B*S, 2743, 2)
+        return hook_tokens_list, [output], self.patch_start_idx, pos_2d

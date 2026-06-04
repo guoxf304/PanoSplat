@@ -1,0 +1,454 @@
+"""SynPano panoramic dataset loader.
+
+Each scene directory layout::
+
+    <SynPano_DIR>/<scene_name>/
+        images/          # RGB equirectangular PNG
+        depth/           # depth in meters (.npy preferred, .png fallback)
+        groundtruth.txt  # frame_id name x y z qx qy qz qw  (camera-to-world)
+
+Poses are interpreted as camera-to-world (c2w): translation (x,y,z) and unit
+quaternion (qx, qy, qz, qw), then converted to world-to-camera (3x4) for training.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import os.path as osp
+import random
+import time
+
+import cv2
+import numpy as np
+import torch
+
+from panovggt.Projection import EquirecRotate
+from training.data.base_dataset import BaseDataset
+from training.data.cache_utils import load_or_build_json_cache
+from training.data.dataset_util import erp_target_resolution, threshold_depth_map
+
+
+def _quat_xyzw_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Hamilton quaternion (x, y, z, w) -> 3x3 rotation matrix."""
+    q = np.array([qx, qy, qz, qw], dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-8:
+        return np.eye(3, dtype=np.float32)
+    x, y, z, w = q / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _c2w_to_w2c(pose_c2w: np.ndarray) -> np.ndarray:
+    R_c2w = pose_c2w[:3, :3]
+    t_c2w = pose_c2w[:3, 3]
+    R_w2c = R_c2w.T
+    t_w2c = -R_w2c @ t_c2w
+    pose_w2c = np.zeros((3, 4), dtype=np.float32)
+    pose_w2c[:3, :3] = R_w2c
+    pose_w2c[:3, 3] = t_w2c
+    return pose_w2c
+
+
+class SynPanoDataset(BaseDataset):
+    """Loader for SynPano synthetic panoramic scenes."""
+
+    def __init__(
+        self,
+        common_conf,
+        split: str = "train",
+        SynPano_DIR: str = "/mnt/gxf/PanoSplat/datasets/SynPano",
+        groundtruth_name: str = "groundtruth.txt",
+        images_subdir: str = "images",
+        depth_subdir: str = "depth",
+        min_num_images: int = 2,
+        len_train: int = 1000,
+        len_test: int = 100,
+        expand_ratio: int = 3,
+        augmentation: dict | None = None,
+        get_nearby: bool | None = None,
+        scene_names: list | None = None,
+        depth_max: float = 50.0,
+        target_resolution: tuple | None = None,
+    ):
+        super().__init__(common_conf=common_conf)
+
+        try:
+            cv2.setNumThreads(0)
+        except Exception:
+            pass
+
+        self.training = common_conf.training
+        self.get_nearby = get_nearby if get_nearby is not None else common_conf.get_nearby
+        self.inside_random = common_conf.inside_random
+        self.allow_duplicate_img = common_conf.allow_duplicate_img
+        self.expand_ratio = expand_ratio
+        self.SynPano_DIR = osp.abspath(SynPano_DIR)
+        self.groundtruth_name = groundtruth_name
+        self.images_subdir = images_subdir
+        self.depth_subdir = depth_subdir
+        self.min_num_images = min_num_images
+        self.split = split
+        self.scene_names = scene_names
+        self.depth_max = float(depth_max)
+        self.target_resolution = target_resolution
+
+        if split == "train":
+            self.mode = "train"
+            self.dataset_length = len_train
+        elif split in ("val", "test", "test_final"):
+            self.mode = "val" if split == "val" else "test"
+            self.dataset_length = len_test
+        else:
+            raise ValueError(f"Invalid split: {split}")
+
+        self.augmentation = augmentation if augmentation is not None else common_conf.augs
+        self._equi_cache = {}
+
+        t0 = time.time()
+        self._load_index_cache()
+        logging.info(f"SynPano index ready in {time.time() - t0:.1f}s")
+
+        self.sequence_list_len = len(self.trajectories)
+        if self.trajectories:
+            self.base_resolution = tuple(self.trajectories[0]["resolution"])
+        else:
+            self.base_resolution = (518, 1036)
+            logging.warning("No SynPano trajectories found.")
+
+        status = "Training" if self.training else "Testing"
+        logging.info(f"{status}: SynPano scenes={self.sequence_list_len}, len={len(self)}")
+
+    def __len__(self):
+        return self.dataset_length
+
+    def _load_index_cache(self):
+        cache_dir = osp.join(self.SynPano_DIR, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        scene_tag = "all" if not self.scene_names else "_".join(sorted(self.scene_names))
+        cache_path = osp.join(cache_dir, f"SynPano_{self.mode}_{scene_tag}_index.json")
+
+        def build_fn():
+            return self._build_index()
+
+        self.trajectories = load_or_build_json_cache(cache_path, build_fn)
+
+    def _build_index(self) -> list:
+        if not osp.isdir(self.SynPano_DIR):
+            raise FileNotFoundError(f"SynPano_DIR not found: {self.SynPano_DIR}")
+
+        scene_dirs = []
+        if self.scene_names:
+            for name in self.scene_names:
+                path = osp.join(self.SynPano_DIR, name)
+                if osp.isdir(path):
+                    scene_dirs.append(path)
+                else:
+                    logging.warning(f"Scene not found, skipping: {path}")
+        else:
+            for entry in sorted(os.listdir(self.SynPano_DIR)):
+                path = osp.join(self.SynPano_DIR, entry)
+                if not osp.isdir(path) or entry == "cache":
+                    continue
+                if osp.isfile(osp.join(path, self.groundtruth_name)):
+                    scene_dirs.append(path)
+
+        trajs = []
+        for scene_dir in scene_dirs:
+            scene_name = osp.basename(scene_dir)
+            frames = self._parse_groundtruth(osp.join(scene_dir, self.groundtruth_name))
+            if len(frames) < self.min_num_images:
+                logging.warning(
+                    f"Scene {scene_name} has {len(frames)} frames (< {self.min_num_images}), skip"
+                )
+                continue
+
+            rgb_dir = osp.join(scene_dir, self.images_subdir)
+            if not osp.isdir(rgb_dir):
+                logging.warning(f"Missing images dir for {scene_name}: {rgb_dir}")
+                continue
+
+            first_rgb = osp.join(rgb_dir, frames[0]["image_name"])
+            if not osp.isfile(first_rgb):
+                logging.warning(f"Missing first RGB for {scene_name}: {first_rgb}")
+                continue
+
+            img_bgr = cv2.imread(first_rgb, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                logging.warning(f"Cannot read RGB for {scene_name}: {first_rgb}")
+                continue
+            h, w = img_bgr.shape[:2]
+
+            trajs.append(
+                {
+                    "scene": scene_name,
+                    "scene_dir": scene_dir,
+                    "frames": frames,
+                    "resolution": [int(h), int(w)],
+                }
+            )
+
+        if not trajs:
+            raise RuntimeError(
+                f"No valid SynPano scenes under {self.SynPano_DIR}. "
+                f"Expected <scene>/images, depth, {self.groundtruth_name}"
+            )
+        logging.info(f"SynPano indexed {len(trajs)} scene(s)")
+        return trajs
+
+    def _parse_groundtruth(self, gt_path: str) -> list:
+        frames = []
+        with open(gt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 9:
+                    logging.warning(f"Skip malformed pose line: {line}")
+                    continue
+                frame_id = int(parts[0])
+                image_name = parts[1]
+                x, y, z = map(float, parts[2:5])
+                qx, qy, qz, qw = map(float, parts[5:9])
+                R = _quat_xyzw_to_rot(qx, qy, qz, qw)
+                c2w = np.eye(4, dtype=np.float32)
+                c2w[:3, :3] = R
+                c2w[:3, 3] = [x, y, z]
+                stem = osp.splitext(image_name)[0]
+                frames.append(
+                    {
+                        "frame_id": frame_id,
+                        "image_name": image_name,
+                        "stem": stem,
+                        "c2w": c2w.tolist(),
+                    }
+                )
+        return frames
+
+    def _resolve_depth_path(self, scene_dir: str, stem: str) -> str | None:
+        depth_dir = osp.join(scene_dir, self.depth_subdir)
+        npy_path = osp.join(depth_dir, f"{stem}.npy")
+        if osp.isfile(npy_path):
+            return npy_path
+        png_path = osp.join(depth_dir, f"{stem}.png")
+        if osp.isfile(png_path):
+            return png_path
+        return None
+
+    def _get_equi_rotate(self, equ_h: int):
+        rot = self._equi_cache.get(equ_h)
+        if rot is None:
+            rot = EquirecRotate(equ_h)
+            self._equi_cache[equ_h] = rot
+        return rot
+
+    def _prepare_augmentation_params(self):
+        if not self.training or not self.augmentation:
+            return None
+
+        def sample_angle(key, default=60.0):
+            if key in self.augmentation and random.random() > 0.5:
+                A = float(self.augmentation[key].get("sample_angle", default))
+                return (np.random.rand() - 0.5) * 2.0 * A
+            return 0.0
+
+        pitch_deg = sample_angle("pitch")
+        yaw_deg = sample_angle("yaw")
+        roll_deg = sample_angle("roll")
+        if abs(pitch_deg) < 1e-6 and abs(yaw_deg) < 1e-6 and abs(roll_deg) < 1e-6:
+            return None
+
+        ax = math.radians(pitch_deg)
+        ay = math.radians(yaw_deg)
+        az = math.radians(roll_deg)
+
+        def Rx(a):
+            c, s = math.cos(a), math.sin(a)
+            return torch.tensor(
+                [[1, 0, 0], [0, c, -s], [0, s, c]], dtype=torch.float32
+            )
+
+        def Ry(a):
+            c, s = math.cos(a), math.sin(a)
+            return torch.tensor(
+                [[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=torch.float32
+            )
+
+        def Rz(a):
+            c, s = math.cos(a), math.sin(a)
+            return torch.tensor(
+                [[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=torch.float32
+            )
+
+        return Rz(az) @ Ry(ay) @ Rx(ax)
+
+    def _read_and_resize_image(self, path, target_resolution):
+        h, w = target_resolution
+        img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise IOError(f"cv2.imread failed: {path}")
+        if img_bgr.shape[:2] != (h, w):
+            img_bgr = cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        return (img_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)
+
+    def _to_single_channel(self, d: np.ndarray) -> np.ndarray:
+        if d.ndim == 3:
+            if d.shape[2] == 3:
+                d = cv2.cvtColor(d, cv2.COLOR_BGR2GRAY)
+            elif d.shape[2] == 4:
+                d = cv2.cvtColor(d, cv2.COLOR_BGRA2GRAY)
+            else:
+                d = d[..., 0]
+        return d
+
+    def _read_and_resize_depth(self, path, target_resolution):
+        h, w = target_resolution
+        if path.endswith(".npy"):
+            d = np.load(path)
+            if d.ndim == 3:
+                d = d[..., 0]
+            d = d.astype(np.float32)
+        else:
+            d = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if d is None:
+                raise IOError(f"cv2.imread failed: {path}")
+            d = self._to_single_channel(d).astype(np.float32)
+            if d.max() > 20.0:
+                d = d / 100.0
+
+        if d.shape[:2] != (h, w):
+            d = cv2.resize(d, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        d = threshold_depth_map(
+            d, max_percentile=-1, min_percentile=-1, max_depth=self.depth_max
+        )
+        d[~np.isfinite(d)] = 0.0
+        return d[np.newaxis, ...]
+
+    def get_data(
+        self,
+        seq_index=None,
+        img_per_seq=None,
+        aspect_ratio=1.0,
+        ids=None,
+        seq_name=None,
+    ):
+        if self.sequence_list_len == 0:
+            raise RuntimeError("SynPanoDataset has no trajectories.")
+
+        if seq_index is None:
+            seq_index = random.randint(0, self.sequence_list_len - 1)
+
+        traj = self.trajectories[seq_index % self.sequence_list_len]
+        scene = traj["scene"]
+        scene_dir = traj["scene_dir"]
+        frames = traj["frames"]
+        orig_resolution = tuple(traj["resolution"])
+        n_frames = len(frames)
+        valid_indices = list(range(n_frames))
+
+        if img_per_seq is None:
+            img_per_seq = random.randint(2, min(24, n_frames))
+        img_per_seq = min(img_per_seq, n_frames)
+
+        if ids is None:
+            ids = np.random.choice(
+                valid_indices, img_per_seq, replace=self.allow_duplicate_img
+            ).tolist()
+
+        if self.get_nearby:
+            ids = self.get_nearby_ids(ids, n_frames, expand_ratio=self.expand_ratio)
+            ids = [int(i) for i in ids if int(i) in valid_indices]
+            if len(ids) < 2:
+                ids = np.random.choice(
+                    valid_indices,
+                    max(2, min(img_per_seq, n_frames)),
+                    replace=self.allow_duplicate_img,
+                ).tolist()
+
+        if self.target_resolution is not None:
+            target_resolution = tuple(self.target_resolution)
+        else:
+            target_resolution = erp_target_resolution(self.img_size, self.patch_size)
+
+        equi_rotate = self._get_equi_rotate(target_resolution[0])
+        rgb_dir = osp.join(scene_dir, self.images_subdir)
+
+        batch_data = {
+            k: []
+            for k in [
+                "images",
+                "depths",
+                "extrinsics",
+                "cam_points",
+                "world_points",
+                "point_masks",
+                "original_sizes",
+            ]
+        }
+        successful_ids = []
+
+        for idx in ids:
+            idx = int(idx)
+            frame = frames[idx]
+            rgb_path = osp.join(rgb_dir, frame["image_name"])
+            depth_path = self._resolve_depth_path(scene_dir, frame["stem"])
+            if not osp.isfile(rgb_path) or depth_path is None:
+                logging.debug(f"Missing rgb/depth for {scene}/{frame['image_name']}")
+                continue
+
+            try:
+                image = self._read_and_resize_image(rgb_path, target_resolution)
+                depth_map = self._read_and_resize_depth(depth_path, target_resolution)
+                c2w = np.array(frame["c2w"], dtype=np.float32)
+                pose_w2c = _c2w_to_w2c(c2w)
+                R_delta = self._prepare_augmentation_params()
+
+                frame_data = self.process_one_image(
+                    image=image,
+                    depth_map=depth_map,
+                    extrinsic_w2c=pose_w2c,
+                    shape=target_resolution,
+                    equi_rotate=equi_rotate,
+                    R_delta=R_delta,
+                    depth_max=self.depth_max,
+                )
+
+                batch_data["images"].append(frame_data["rgb"])
+                batch_data["depths"].append(frame_data["depth_tensor"])
+                batch_data["extrinsics"].append(frame_data["extrinsic"])
+                batch_data["cam_points"].append(frame_data["cam_coords"])
+                batch_data["world_points"].append(frame_data["world_coords"])
+                batch_data["point_masks"].append(frame_data["valid_mask"])
+                batch_data["original_sizes"].append(np.array(orig_resolution))
+                successful_ids.append(idx)
+            except Exception as e:
+                logging.warning(
+                    f"Error processing {scene}/{frame['image_name']}: {e}"
+                )
+                continue
+
+        if len(batch_data["images"]) < 2:
+            logging.error("Not enough valid SynPano frames, retrying sample...")
+            return self.get_data(
+                seq_index=seq_index,
+                img_per_seq=img_per_seq,
+                aspect_ratio=aspect_ratio,
+            )
+
+        return {
+            "seq_name": f"SynPano_{scene}",
+            "ids": successful_ids,
+            "frame_num": len(batch_data["extrinsics"]),
+            **batch_data,
+        }

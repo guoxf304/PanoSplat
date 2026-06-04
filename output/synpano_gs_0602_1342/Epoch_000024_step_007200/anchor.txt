@@ -1,0 +1,55 @@
+epoch: 24
+global_step: 7200
+use_gt_pose: True
+
+[alignment_policy]
+  gaussian_cloud: built from gs_anchor_idx (anchor frame DPT + adapter)
+  render_camera: gt_raw['extrinsics'][tensor_bi, cur_view_idx] when use_gt_pose
+  forbidden_slices: [bi,0] unless cur_view_idx==0; [0,vi]; [0,0]
+
+[records]
+  dataloader_batch=0 tensor_bi=0 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[0, 0] anchor_eq_view=False means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=0 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[0, 1] anchor_eq_view=True means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=1 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[1, 0] anchor_eq_view=False means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=1 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[1, 1] anchor_eq_view=True means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=2 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[2, 0] anchor_eq_view=False means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=2 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[2, 1] anchor_eq_view=True means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=3 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[3, 0] anchor_eq_view=False means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=0 tensor_bi=3 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[3, 1] anchor_eq_view=True means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=0 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[0, 0] anchor_eq_view=False means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=0 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[0, 1] anchor_eq_view=True means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=1 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[1, 0] anchor_eq_view=False means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=1 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[1, 1] anchor_eq_view=True means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=2 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[2, 0] anchor_eq_view=False means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=2 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[2, 1] anchor_eq_view=True means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=3 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[3, 0] anchor_eq_view=False means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=1 tensor_bi=3 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[3, 1] anchor_eq_view=True means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=0 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[0, 0] anchor_eq_view=False means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=0 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[0, 1] anchor_eq_view=True means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=1 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[1, 0] anchor_eq_view=False means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=1 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[1, 1] anchor_eq_view=True means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=2 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[2, 0] anchor_eq_view=False means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=2 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[2, 1] anchor_eq_view=True means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=3 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[3, 0] anchor_eq_view=False means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=2 tensor_bi=3 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[3, 1] anchor_eq_view=True means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=0 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[0, 0] anchor_eq_view=False means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=0 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[0, 1] anchor_eq_view=True means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=1 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[1, 0] anchor_eq_view=False means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=1 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[1, 1] anchor_eq_view=True means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=2 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[2, 0] anchor_eq_view=False means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=2 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[2, 1] anchor_eq_view=True means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=3 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[3, 0] anchor_eq_view=False means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=3 tensor_bi=3 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[3, 1] anchor_eq_view=True means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=0 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[0, 0] anchor_eq_view=False means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=0 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[0, 1] anchor_eq_view=True means_source=world_points[0, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=1 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[1, 0] anchor_eq_view=False means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=1 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[1, 1] anchor_eq_view=True means_source=world_points[1, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=2 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[2, 0] anchor_eq_view=False means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=2 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[2, 1] anchor_eq_view=True means_source=world_points[2, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=3 anchor_idx=1 cur_view_idx=0 extrinsics_slice=[3, 0] anchor_eq_view=False means_source=world_points[3, 1] [OK] ok
+  dataloader_batch=4 tensor_bi=3 anchor_idx=1 cur_view_idx=1 extrinsics_slice=[3, 1] anchor_eq_view=True means_source=world_points[3, 1] [OK] ok
+
+[axis_alignment]
+  gs_cross_view_axis_align: none
+  env PANOSPLAT_GS_AXIS_ALIGN: 
+  ERP rays: OpenCV (+X right, +Y down, +Z forward); ODGS lon=atan2(x,z), lat=atan2(-y,sqrt(x^2+z^2))

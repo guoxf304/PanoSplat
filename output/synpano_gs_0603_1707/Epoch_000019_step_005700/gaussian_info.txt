@@ -1,0 +1,19 @@
+epoch: 19
+global_step: 5700
+phase: val
+num_batches: 5
+num_gaussians: 7614856
+
+[Scale Audit]
+  mean: 0.049999
+  max: 0.050000
+  std: 0.000100
+  at_hard_cap_pct (scale >= 0.049000): 99.9700%
+
+[Opacity & Saturation Audit]
+  mean: 0.257031
+  min: 0.050000
+  saturated_pct (opacity > 0.99): 3.7404%
+
+[Shape Aspect Ratio Audit]
+  mean (max_axis / min_axis): 1.000042

@@ -821,3 +821,14 @@ def transform_pano_track_points(track: torch.Tensor, rot_matrix: torch.Tensor, s
     v_new = v_norm_new * (H - 1)
 
     return torch.stack([u_new, v_new], dim=1).to(device)
+
+
+def erp_target_resolution(img_size: int, patch_size: int = 14) -> tuple[int, int]:
+    """Return ERP ``(H, W)`` with ``W = 2 * H``, both divisible by ``patch_size``.
+
+    Standard PanoVGGT resolution: ``img_size=518`` → ``(518, 1036)``.
+    """
+    patch = max(1, int(patch_size))
+    h = max(patch, (int(img_size) // patch) * patch)
+    w = h * 2
+    return h, w

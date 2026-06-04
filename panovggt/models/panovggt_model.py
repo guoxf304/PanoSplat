@@ -14,6 +14,7 @@ from panovggt.layers.transformer_head import (
     ContextTransformerDecoder,
 )
 from panovggt.layers.camera_head import CameraHead
+from panovggt.utils.gs_debug import gs_debug_print, is_gs_debug_enabled
 
 
 def _homogenize_points(xyz: torch.Tensor) -> torch.Tensor:
@@ -277,25 +278,69 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         if images.dim() == 4:
+            if images.shape[1] != 3:
+                raise ValueError(
+                    f"Expected (S, 3, H, W) or (B, S, 3, H, W), got {tuple(images.shape)}"
+                )
             images = images.unsqueeze(0)
         B, S, _, H, W = images.shape # shape: (B, S, C, H, W)
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
         # Aggregator forward
         out = self.aggregator(images)
-        if isinstance(out, (list, tuple)):
+        aggregated_hooks = None
+        if isinstance(out, tuple) and len(out) == 4:
+            first, second, patch_start_idx, pos_2d_from_agg = out
+            dec_dim = getattr(self.aggregator, "dec_embed_dim", None)
+
+            def _last_dim(x):
+                if isinstance(x, list) and len(x) > 0 and torch.is_tensor(x[0]):
+                    return int(x[0].shape[-1])
+                if torch.is_tensor(x):
+                    return int(x.shape[-1])
+                return None
+
+            d0, d1 = _last_dim(first), _last_dim(second)
+            swapped = False
+            if (
+                dec_dim is not None
+                and d0 == 2 * dec_dim
+                and d1 == dec_dim
+            ):
+                aggregated_hooks, token_list = second, first
+                swapped = True
+            else:
+                aggregated_hooks, token_list = first, second
+            if is_gs_debug_enabled():
+                gs_debug_print(
+                    "aggregator.unpack",
+                    B=B,
+                    S=S,
+                    H=H,
+                    W=W,
+                    dec_dim=dec_dim,
+                    d0=d0,
+                    d1=d1,
+                    swapped_hooks_token=swapped,
+                    hooks0=aggregated_hooks[0] if aggregated_hooks else None,
+                    token0=token_list[-1] if isinstance(token_list, list) else token_list,
+                )
+            tokens = token_list[-1] if isinstance(token_list, list) else token_list
+        elif isinstance(out, (list, tuple)):
             tokens = out[0][-1] if isinstance(out[0], list) else out[0]
             patch_start_idx = out[1]
+            pos_2d_from_agg = out[2] if len(out) > 2 else None
         else:
             tokens = out
             patch_start_idx = 0
+            pos_2d_from_agg = None
 
         if tokens.dim() == 4:
             tokens = tokens.view(B * S, tokens.shape[2], tokens.shape[3]) # (B*S, 2743, 2048)
 
         # RoPE position indices
-        pos_2d = None
-        if getattr(self.aggregator, "rope", None) is not None:
+        pos_2d = pos_2d_from_agg
+        if pos_2d is None and getattr(self.aggregator, "rope", None) is not None:
             pos_2d = self.aggregator.position_getter(B * S, patch_h, patch_w, tokens.device)
             pos_2d = pos_2d + 1
             pos_special = torch.zeros(
@@ -391,6 +436,18 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             predictions["global_points"] = global_points
         else:
             predictions["global_points"] = None
+
+        if aggregated_hooks is not None:
+            dec_dim = getattr(self.aggregator, "dec_embed_dim", None)
+            if dec_dim is not None:
+                for i, h in enumerate(aggregated_hooks):
+                    if h.shape[-1] not in (dec_dim, 2 * dec_dim):
+                        raise RuntimeError(
+                            f"aggregated_hooks[{i}] has dim {h.shape[-1]}, expected "
+                            f"decoder hook {dec_dim} or fused {2 * dec_dim}; "
+                            "check Aggregator return order (hooks vs token_list)."
+                        )
+            predictions["aggregated_hooks"] = aggregated_hooks
 
         if not self.training:
             predictions["images"] = images

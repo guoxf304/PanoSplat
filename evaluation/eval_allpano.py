@@ -354,7 +354,7 @@ def main():
 
     # ── common dataset config ────────────────────────────────────────
     common = SimpleNamespace(
-        img_size=336, patch_size=14, rescale=None, rescale_aug=None,
+        img_size=518, patch_size=14, rescale=None, rescale_aug=None,
         landscape_check=False, training=False, get_nearby=True,
         inside_random=False, allow_duplicate_img=True, augs=None, debug=False,
     )

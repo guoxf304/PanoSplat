@@ -14,7 +14,6 @@ from torch.utils.data import Dataset
 from torch.utils.data import ConcatDataset
 import bisect
 from .dataset_util import *
-from .track_util import *
 from .augmentation import PanoAugmentation
 
 
@@ -121,6 +120,8 @@ class ComposedDataset(Dataset, ABC):
                 sample["track_positive_mask"] = torch.ones(sample["track_vis_mask"].shape[1]).bool()
 
             else:
+                from .track_util import build_tracks_by_depth_pano
+
                 # Generate tracks on-the-fly using the final processed Tensors.
                 tracks, track_vis_mask, track_positive_mask = build_tracks_by_depth_pano(
                     sample["extrinsics"],
