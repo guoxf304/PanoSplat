@@ -222,7 +222,7 @@ def render_erp(
     """
     Differentiable ERP render via ODGS rasterizer.
 
-    Returns dict with keys: render, depth, accuracy, radii, ...
+    Returns dict with keys: render, depth, render_alpha (coverage A), accuracy, radii, ...
     """
     _require_odgs()
     from odgs_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -286,6 +286,7 @@ def render_erp(
     return {
         "render": rendered_image,
         "depth": depth,
+        "render_alpha": acc,
         "accuracy": acc,
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,

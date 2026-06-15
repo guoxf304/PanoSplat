@@ -16,8 +16,9 @@ import argparse
 import contextlib
 import glob
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, TextIO, Tuple
 
 import cv2
 import numpy as np
@@ -28,14 +29,75 @@ from hydra.initialize import initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf, open_dict
 
-from panovggt.models.loss import Loss
 from panovggt.models.loss_gs import GSLoss
-from panovggt.render.coord_frame import resolve_scene_scale
-from panovggt.render.camera import build_erp_camera
 from panovggt.render.odgs_bridge import check_odgs_available, render_erp
+from panovggt.utils.erp_loss import l1_erp, psnr_erp, ssim_erp
+from training.train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from panovggt.utils.gs_ply_export import save_gaussian_splat_ply
+from panovggt.utils.lpips_metric import compute_lpips, get_lpips_model, lpips_backend_name
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+
+
+@dataclass
+class ViewMetrics:
+    name: str
+    l1: float
+    ws_psnr: float
+    psnr: float
+    ssim: float
+    lpips: float
+
+
+def _fmt_psnr(val: float) -> str:
+    return "inf" if val == float("inf") else f"{val:.4f}"
+
+
+def _fmt_ssim(val: float) -> str:
+    return f"{val:.4f}"
+
+
+def _fmt_lpips(val: float) -> str:
+    return "nan" if val != val else f"{val:.4f}"
+
+
+def _mean_metric(values: List[float]) -> float:
+    valid = [v for v in values if v == v]
+    return sum(valid) / len(valid) if valid else float("nan")
+
+
+def _write_metrics_table(f: TextIO, records: List[ViewMetrics]) -> None:
+    f.write("Per-image metrics:\n")
+    if not records:
+        f.write("(no images)\n")
+        return
+
+    name_w = max(len("image"), *(len(r.name) for r in records))
+    f.write(
+        f"{'image':<{name_w}}  {'L1':>10}  {'WS-PSNR':>10}  {'PSNR-ERP':>10}  "
+        f"{'SSIM':>10}  {'LPIPS':>10}\n"
+    )
+    for r in records:
+        f.write(
+            f"{r.name:<{name_w}}  {r.l1:>10.6f}  {_fmt_psnr(r.ws_psnr):>10}  "
+            f"{_fmt_psnr(r.psnr):>10}  {_fmt_ssim(r.ssim):>10}  "
+            f"{_fmt_lpips(r.lpips):>10}\n"
+        )
+
+
+def _write_mean_metrics(f: TextIO, records: List[ViewMetrics]) -> None:
+    f.write("Mean:\n")
+    if not records:
+        f.write("WS-PSNR: nan dB\nPSNR: nan dB\nSSIM: nan\nLPIPS: nan\n")
+        return
+    mean_ws = _mean_metric([r.ws_psnr for r in records])
+    mean_psnr = _mean_metric([r.psnr for r in records])
+    mean_ssim = _mean_metric([r.ssim for r in records])
+    mean_lpips = _mean_metric([r.lpips for r in records])
+    f.write(f"WS-PSNR: {_fmt_psnr(mean_ws)} dB\n")
+    f.write(f"PSNR: {_fmt_psnr(mean_psnr)} dB\n")
+    f.write(f"SSIM: {_fmt_ssim(mean_ssim)}\n")
+    f.write(f"LPIPS: {_fmt_lpips(mean_lpips)}\n")
 
 # Match inference.py: H=518, W=1036 (2:1 ERP, divisible by patch_size=14)
 _INPUT_H = 518
@@ -72,12 +134,77 @@ def load_images(
     return batch, previews
 
 
-def load_model_from_config(
+def _stack_gt_render_error(
+    gt: torch.Tensor, render: torch.Tensor, error_map: torch.Tensor
+) -> torch.Tensor:
+    """Vertical stack: GT | Render | Error (CHW), same as gs_epoch_infer."""
+    return torch.cat([gt, render, error_map], dim=1)
+
+
+def build_export_style_batch(images: torch.Tensor) -> dict:
+    """
+    Build a dataloader-style batch for ``GSLoss.prepare_render_bundle``.
+
+    Mirrors SynPano images-only placeholders + ``Trainer._process_batch`` normalization
+    used by training export (``gs_epoch_infer``).
+    """
+    if images.dim() == 4:
+        images = images.unsqueeze(0)
+    b, s, _, h, w = images.shape
+    target_device = images.device
+
+    extrinsics = torch.zeros(b, s, 3, 4, dtype=torch.float32)
+    extrinsics[..., :3, :3] = torch.eye(3)
+
+    point_masks = torch.ones(b, s, h, w, dtype=torch.bool)
+    depths = torch.ones(b, s, h, w, dtype=torch.float32)
+    cam_points = torch.zeros(b, s, h, w, 3, dtype=torch.float32)
+    world_points = torch.zeros(b, s, h, w, 3, dtype=torch.float32)
+
+    batch = {
+        "images": images.detach().cpu().float(),
+        "extrinsics": extrinsics,
+        "cam_points": cam_points,
+        "world_points": world_points,
+        "depths": depths,
+        "point_masks": point_masks,
+    }
+
+    norm_ext, norm_cam, norm_world, norm_depth, norm_factors = (
+        normalize_camera_extrinsics_and_points_batch(
+            extrinsics=batch["extrinsics"],
+            cam_points=batch["cam_points"],
+            world_points=batch["world_points"],
+            depths=batch["depths"],
+            point_masks=batch["point_masks"],
+        )
+    )
+    batch["extrinsics"] = norm_ext
+    batch["cam_points"] = norm_cam
+    batch["world_points"] = norm_world
+    batch["depths"] = norm_depth
+    batch["norm_factors"] = norm_factors
+
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            batch[key] = value.to(target_device)
+    return batch
+
+
+def _resolve_checkpoint_global_step(ckpt: dict) -> Optional[int]:
+    for key in ("global_step", "step", "iteration"):
+        if key in ckpt and ckpt[key] is not None:
+            return int(ckpt[key])
+    return None
+
+
+def load_model_and_loss_from_config(
     config_name: str,
     checkpoint_path: str,
     device: str,
     *,
     img_size: int,
+    global_step: Optional[int] = None,
 ):
     config_dir = os.path.join(os.path.dirname(__file__), "training", "config")
     with initialize_config_dir(version_base=None, config_dir=config_dir):
@@ -88,6 +215,7 @@ def load_model_from_config(
         if cfg.get("model") is not None:
             cfg.model.img_size = img_size
     model = instantiate(cfg.model, _recursive_=True)
+    loss_fn = instantiate(cfg.loss, _recursive_=True)
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state = ckpt.get("model", ckpt)
     state = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
@@ -97,7 +225,18 @@ def load_model_from_config(
         print(f"[load] missing ({len(missing)}): {missing[:8]}...")
     if unexpected:
         print(f"[load] unexpected ({len(unexpected)}): {unexpected[:8]}...")
-    return model.to(device).eval(), cfg
+
+    step = global_step
+    if step is None:
+        step = _resolve_checkpoint_global_step(ckpt)
+    if step is not None and hasattr(model, "set_global_step"):
+        model.set_global_step(int(step))
+        print(f"[load] model global_step={int(step)}")
+
+    model = model.to(device).eval()
+    loss_fn = loss_fn.to(device)
+    loss_fn.eval()
+    return model, loss_fn, cfg
 
 
 def pseudo_gt_from_pred(pred: dict) -> dict:
@@ -258,6 +397,7 @@ def export_panovggt_geometry_pointclouds(
 @torch.no_grad()
 def run_gs_inference(
     model,
+    loss_fn: GSLoss,
     images: torch.Tensor,
     image_paths: List[str],
     output_dir: str,
@@ -267,9 +407,15 @@ def run_gs_inference(
         raise RuntimeError("odgs_gaussian_rasterization is required for ERP rendering.")
 
     render_dir = os.path.join(output_dir, "renders")
+    compare_dir = os.path.join(output_dir, "render_gt_images")
     gs_dir = os.path.join(output_dir, "gaussians")
     os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(compare_dir, exist_ok=True)
     os.makedirs(gs_dir, exist_ok=True)
+
+    if images.dim() == 4:
+        images = images.unsqueeze(0)
+    batch = build_export_style_batch(images)
 
     amp_ctx = (
         torch.amp.autocast("cuda", dtype=torch.bfloat16)
@@ -277,79 +423,117 @@ def run_gs_inference(
         else contextlib.nullcontext()
     )
     with amp_ctx:
-        pred = model(images=images)
+        pred = model(images=batch["images"])
 
     if "gaussian_adapter_out" not in pred:
         raise RuntimeError("Model did not return gaussian_adapter_out; is enable_gaussian=True?")
 
-    gt = pseudo_gt_from_pred(pred)
+    gt_geom = pseudo_gt_from_pred(pred)
     n_per_frame, n_merged = export_panovggt_geometry_pointclouds(
         pred,
-        images,
+        batch["images"],
         image_paths,
         output_dir,
-        valid_masks=gt.get("valid_masks"),
+        valid_masks=gt_geom.get("valid_masks"),
     )
 
-    geo = Loss(train_conf=False)
-    gs_loss = GSLoss(lambda_rgb=1.0, lambda_geo=0.0, use_gt_pose=False)
-    pred_norm = geo.normalize_pred(
-        {k: v.clone() if torch.is_tensor(v) else v for k, v in pred.items()}, gt
+    pred_render, gt, norm_factor, imgs = loss_fn.prepare_render_bundle(pred, batch)
+    poses = (
+        gt["camera_poses"]
+        if loss_fn.use_gt_pose
+        else pred_render.get("camera_poses")
     )
-    norm_factor = resolve_scene_scale(pred_norm, gt, None)
+    if poses is None:
+        raise RuntimeError("Missing camera_poses for rendering.")
+    poses = poses.float()
 
-    gt_render = {
-        "valid_masks": gt["valid_masks"],
-        "camera_poses": pred_norm["camera_poses"],
-        "global_points": pred_norm.get("global_points"),
-    }
-    adapter_out = pred_norm["gaussian_adapter_out"]
-    aligned_xyz = gs_loss._build_aligned_cloud_xyz(
-        pred_norm, gt_render, adapter_out, 0
+    adapter_out = pred_render.get("gaussian_adapter_out")
+    if not adapter_out:
+        raise RuntimeError("No gaussian_adapter_out after prepare_render_bundle.")
+
+    cloud = loss_fn.prepare_render_cloud_for_batch_item(
+        pred_render, gt, adapter_out, 0, norm_factor
     )
-    cloud = gs_loss._prepare_render_cloud(
-        adapter_out[0].cloud,
-        norm_factor,
-        0,
-        aligned_xyz=aligned_xyz,
-        xyz_already_normalized=aligned_xyz is not None,
-    )
-    if cloud.get_xyz.numel() == 0:
+    if cloud is None or cloud.get_xyz.numel() == 0:
         raise RuntimeError("Empty Gaussian cloud after masking.")
 
-    poses = pred_norm["camera_poses"].float()
-
-    # ── save Gaussians as standard 3DGS PLY (Supersplat-compatible) ─────────
     save_gaussian_splat_ply(os.path.join(gs_dir, "gaussians.ply"), cloud)
     xyz = cloud.get_xyz.detach().cpu().numpy()
 
-    b, s = images.shape[0], images.shape[1]
-    h, w = images.shape[-2], images.shape[-1]
-    bg = gs_loss._bg.to(device=device, dtype=torch.float32)
-    pipe = gs_loss.render_pipe
+    b, s = imgs.shape[0], imgs.shape[1]
+    h, w = imgs.shape[-2], imgs.shape[-1]
+    bg = loss_fn._bg.to(device=device, dtype=torch.float32)
+    pipe = loss_fn.render_pipe
 
     anchor = int(pred["gs_anchor_idx"][0].item()) if "gs_anchor_idx" in pred else s // 2
     gs_mode = pred.get("gs_means_mode", "anchor")
     print(
         f"[infer] sequence length S={s}, anchor view={anchor}, "
-        f"gs_means_mode={gs_mode}, Gaussians={xyz.shape[0]:,}"
+        f"gs_means_mode={gs_mode}, Gaussians={xyz.shape[0]:,}, "
+        f"use_gt_pose={loss_fn.use_gt_pose}, "
+        f"axis_align={loss_fn.gs_cross_view_axis_align}"
     )
 
-    for vi in range(s):
-        cam = build_erp_camera(poses[0, vi], h, w, device)
-        pkg = render_erp(cloud, cam, bg, pipe=pipe)
-        rendered = pkg["render"].float().clamp(0, 1).cpu()
-        stem = Path(image_paths[vi]).stem
-        out_render = os.path.join(render_dir, f"{stem}_render.png")
-        torchvision.utils.save_image(rendered, out_render)
+    get_lpips_model(device)
+    backend = lpips_backend_name()
+    if backend:
+        print(f"[infer] LPIPS backend: {backend}")
+    else:
+        print("[warn] LPIPS unavailable; install with: pip install lpips")
 
-        gt_rgb = images[0, vi].detach().cpu().clamp(0, 1)
+    metric_records: List[ViewMetrics] = []
+
+    for vi in range(s):
+        view_cloud = loss_fn.cloud_for_view_render(cloud, pred_render, 0, vi)
+        cam = loss_fn.build_render_camera(
+            batch,
+            gt,
+            pred_render,
+            0,
+            vi,
+            h,
+            w,
+            device,
+        )
+        pkg = render_erp(view_cloud, cam, bg, pipe=pipe)
+        rendered = pkg["render"].float().clamp(0.0, 1.0)
+        target = imgs[0, vi].float().clamp(0.0, 1.0)
+        error_map = torch.abs(rendered - target)
+
+        stem = Path(image_paths[vi]).stem
+        image_name = Path(image_paths[vi]).name
+        out_render = os.path.join(render_dir, f"{stem}_render.png")
+        torchvision.utils.save_image(rendered.cpu(), out_render)
         out_gt = os.path.join(render_dir, f"{stem}_input.png")
-        torchvision.utils.save_image(gt_rgb, out_gt)
+        torchvision.utils.save_image(target.cpu(), out_gt)
+
+        stack = _stack_gt_render_error(target, rendered, error_map)
+        out_compare = os.path.join(compare_dir, f"view{vi:02d}_compare.png")
+        torchvision.utils.save_image(stack.cpu(), out_compare)
+
+        l1 = float(l1_erp(rendered.unsqueeze(0), target.unsqueeze(0)).item())
+        ws_psnr = psnr_erp(rendered.cpu(), target.cpu())
+        psnr = psnr_erp(rendered, target)
+        ssim = float(ssim_erp(rendered.unsqueeze(0), target.unsqueeze(0)).item())
+        lpips = compute_lpips(rendered, target)
+        metric_records.append(
+            ViewMetrics(
+                name=image_name,
+                l1=l1,
+                ws_psnr=ws_psnr,
+                psnr=psnr,
+                ssim=ssim,
+                lpips=lpips,
+            )
+        )
+        print(
+            f"[infer] {image_name}: L1={l1:.6f}, WS-PSNR={_fmt_psnr(ws_psnr)} dB, "
+            f"PSNR-ERP={_fmt_psnr(psnr)} dB, SSIM={_fmt_ssim(ssim)}, LPIPS={_fmt_lpips(lpips)}"
+        )
 
         if vi == anchor:
             torchvision.utils.save_image(
-                rendered, os.path.join(render_dir, "anchor_render.png")
+                rendered.cpu(), os.path.join(render_dir, "anchor_render.png")
             )
 
     meta_path = os.path.join(output_dir, "info.txt")
@@ -357,14 +541,43 @@ def run_gs_inference(
         f.write(f"images: {len(image_paths)}\n")
         f.write(f"anchor_view: {anchor}\n")
         f.write(f"gs_means_mode: {pred.get('gs_means_mode', 'anchor')}\n")
+        f.write(f"use_gt_pose: {loss_fn.use_gt_pose}\n")
+        f.write(f"gs_cross_view_axis_align: {loss_fn.gs_cross_view_axis_align}\n")
         f.write(f"num_gaussians: {xyz.shape[0]}\n")
         f.write(f"geometry_per_frame_ply: {n_per_frame}\n")
         f.write(f"geometry_merged_points: {n_merged}\n")
         f.write(f"geometry_ply_dir: {os.path.join(output_dir, 'pointclouds')}\n")
         f.write(f"gaussian_ply: {os.path.join(gs_dir, 'gaussians.ply')}\n")
+        f.write(f"compare_dir: {compare_dir}\n")
         f.write(f"resolution: {h}x{w}\n")
+        f.write("\n[image_paths]\n")
         for i, p in enumerate(image_paths):
             f.write(f"  [{i}] {p}\n")
+        f.write("\n")
+        _write_metrics_table(f, metric_records)
+        f.write("\n")
+        _write_mean_metrics(f, metric_records)
+        if metric_records:
+            f.write("\n[render_quality_avg]\n")
+            f.write(f"  l1: {_mean_metric([r.l1 for r in metric_records]):.6f}\n")
+            f.write(f"  psnr: {_mean_metric([r.psnr for r in metric_records]):.4f}\n")
+            f.write(f"  ssim: {_mean_metric([r.ssim for r in metric_records]):.6f}\n")
+            mean_lpips = _mean_metric([r.lpips for r in metric_records])
+            f.write(
+                f"  lpips: {_fmt_lpips(mean_lpips)}\n"
+                if mean_lpips == mean_lpips
+                else "  lpips: nan\n"
+            )
+
+    if metric_records:
+        mean_ws = _mean_metric([r.ws_psnr for r in metric_records])
+        mean_psnr = _mean_metric([r.psnr for r in metric_records])
+        mean_ssim = _mean_metric([r.ssim for r in metric_records])
+        mean_lpips = _mean_metric([r.lpips for r in metric_records])
+        print(
+            f"[infer] mean WS-PSNR={_fmt_psnr(mean_ws)} dB, PSNR-ERP={_fmt_psnr(mean_psnr)} dB, "
+            f"SSIM={_fmt_ssim(mean_ssim)}, LPIPS={_fmt_lpips(mean_lpips)}"
+        )
     print(f"[done] outputs → {output_dir}")
 
 
@@ -379,6 +592,12 @@ def main():
     parser.add_argument("--image_dir", default="examples/apartment")
     parser.add_argument("--output_dir", default="output/apartment")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--global_step",
+        type=int,
+        default=None,
+        help="Override model global_step (default: read from checkpoint if present).",
+    )
     args = parser.parse_args()
 
     device = torch.device(
@@ -393,15 +612,16 @@ def main():
     if height % patch != 0 or width % patch != 0:
         raise ValueError(f"H,W must be divisible by patch_size={patch}")
 
-    model, _ = load_model_from_config(
+    model, loss_fn, _ = load_model_and_loss_from_config(
         args.config,
         args.checkpoint,
         str(device),
         img_size=height,
+        global_step=args.global_step,
     )
     print(f"[infer] {len(image_paths)} images → {height}x{width} (fixed, same as inference.py)")
     images, _ = load_images(image_paths, height, width, device)
-    run_gs_inference(model, images, image_paths, args.output_dir, device)
+    run_gs_inference(model, loss_fn, images, image_paths, args.output_dir, device)
 
 
 if __name__ == "__main__":

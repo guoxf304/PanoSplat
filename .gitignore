@@ -4,11 +4,25 @@ checkpoints/
 *.pth
 *.ckpt
 
+# 忽略训练/推理输出目录（含 checkpoint、渲染图、点云等）
+output/
+logs/
+
 # 忽略离线推理结果和临时生成的三维点云资产
 results/
 *.ply
 *.png
 *.npy
+
+# X_debug 诊断工具：纳入 Git（脚本 / 报告），仅忽略其中间产物
+!/X_debug/
+!/X_debug/**
+!/X_debug/**/*
+/X_debug/**/*.ply
+/X_debug/**/*.png
+/X_debug/**/*.npy
+/X_debug/**/*.pt
+/X_debug/**/*.pth
 
 # 忽略本地开发环境和缓存
 .idea/

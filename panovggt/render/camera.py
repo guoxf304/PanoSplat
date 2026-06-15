@@ -88,14 +88,8 @@ def build_erp_camera(
     else:
         c2w = c2w.float()
 
-    world_view_transform = _c2w_to_world_view_transform(c2w)
-    cam_center = torch.linalg.inv(world_view_transform)[3, :3]
-    return ERPPanoCamera(
-        image_height=int(height),
-        image_width=int(width),
-        world_view_transform=world_view_transform,
-        camera_center=cam_center,
-    )
+    w2c = torch.linalg.inv(c2w)
+    return build_erp_camera_from_w2c(w2c, height, width, device=c2w.device)
 
 
 def colmap_w2c_from_c2w(c2w: Union[torch.Tensor, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:

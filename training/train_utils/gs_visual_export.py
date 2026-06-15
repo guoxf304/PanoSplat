@@ -10,8 +10,6 @@ import torch
 import torchvision
 
 from panovggt.models.loss_gs import GSLoss
-from panovggt.render.camera import build_erp_camera, build_erp_camera_from_w2c
-from panovggt.render.coord_frame import resolve_scene_scale
 from panovggt.render.odgs_bridge import check_odgs_available, render_erp
 from train_utils.general import copy_data_to_device
 
@@ -82,24 +80,17 @@ def export_erp_visual_comparison(
             ):
                 pred = model(images=batch["images"])
 
-            gt = loss_fn.geo_loss.prepare_gt(batch)
-            norm_factor = resolve_scene_scale(pred, gt, batch)
-            imgs = loss_fn._denorm_images(batch["images"])
-            if not loss_fn.use_gt_pose:
-                pred_render = {
-                    k: (v.clone() if torch.is_tensor(v) else v)
-                    for k, v in pred.items()
-                }
-                loss_fn.geo_loss.normalize_pred(pred_render, gt)
-            else:
-                pred_render = pred
-            if loss_fn.use_gt_pose:
-                poses = gt["camera_poses"]
-            else:
-                poses = pred_render.get("camera_poses")
-                if poses is None:
-                    logger.warning("visual_export: missing camera_poses, skip batch.")
-                    continue
+            pred_render, gt, norm_factor, imgs = loss_fn.prepare_render_bundle(
+                pred, batch
+            )
+            poses = (
+                gt["camera_poses"]
+                if loss_fn.use_gt_pose
+                else pred_render.get("camera_poses")
+            )
+            if poses is None:
+                logger.warning("visual_export: missing camera_poses, skip batch.")
+                continue
             poses = poses.float()
 
             b = imgs.shape[0]
@@ -111,17 +102,10 @@ def export_erp_visual_comparison(
                     logger.warning("visual_export: empty cloud at batch %s, skip.", bi)
                     continue
 
-                aligned_xyz = loss_fn._build_aligned_cloud_xyz(
-                    pred_render, gt, adapter_out, bi
+                cloud = loss_fn.prepare_render_cloud_for_batch_item(
+                    pred_render, gt, adapter_out, bi, norm_factor
                 )
-                cloud = loss_fn._prepare_render_cloud(
-                    adapter_out[bi].cloud,
-                    norm_factor,
-                    bi,
-                    aligned_xyz=aligned_xyz,
-                    xyz_already_normalized=aligned_xyz is not None,
-                )
-                if cloud.get_xyz.numel() == 0:
+                if cloud is None or cloud.get_xyz.numel() == 0:
                     continue
 
                 vi = view_index
@@ -130,17 +114,21 @@ def export_erp_visual_comparison(
                     vi = int(anchor[bi].item()) if anchor is not None else 0
                 vi = max(0, min(vi, poses.shape[1] - 1))
 
-                if loss_fn.use_gt_pose and batch.get("extrinsics") is not None:
-                    w2c = batch["extrinsics"][bi, vi].float()
-                    cam = build_erp_camera_from_w2c(
-                        w2c, imgs.shape[-2], imgs.shape[-1], trainer.device
-                    )
-                else:
-                    cam = build_erp_camera(
-                        poses[bi, vi], imgs.shape[-2], imgs.shape[-1], trainer.device
-                    )
+                view_cloud = loss_fn.cloud_for_view_render(
+                    cloud, pred_render, bi, vi
+                )
+                cam = loss_fn.build_render_camera(
+                    batch,
+                    gt,
+                    pred_render,
+                    bi,
+                    vi,
+                    imgs.shape[-2],
+                    imgs.shape[-1],
+                    trainer.device,
+                )
                 try:
-                    pkg = render_erp(cloud, cam, bg, pipe=pipe)
+                    pkg = render_erp(view_cloud, cam, bg, pipe=pipe)
                 except RuntimeError as exc:
                     logger.warning("visual_export: render failed: %s", exc)
                     continue

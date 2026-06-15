@@ -3,12 +3,16 @@
 Each scene directory layout::
 
     <SynPano_DIR>/<scene_name>/
-        images/          # RGB equirectangular PNG
-        depth/           # depth in meters (.npy preferred, .png fallback)
-        groundtruth.txt  # frame_id name x y z qx qy qz qw  (camera-to-world)
+        images/          # RGB equirectangular images
+        depth/           # optional when require_depth=True
+        groundtruth.txt  # optional when require_pose=True
 
-Poses are interpreted as camera-to-world (c2w): translation (x,y,z) and unit
-quaternion (qx, qy, qz, qw), then converted to world-to-camera (3x4) for training.
+Images-only GS training (frozen geometry, merged render)::
+
+    require_depth=False, require_pose=False
+    → only ``images/`` is required; placeholder depth, identity poses, all-valid masks.
+
+Full layout uses groundtruth poses (c2w: x,y,z + quaternion) converted to w2c for the batch.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ from panovggt.Projection import EquirecRotate
 from training.data.base_dataset import BaseDataset
 from training.data.cache_utils import load_or_build_json_cache
 from training.data.dataset_util import erp_target_resolution, threshold_depth_map
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 def _quat_xyzw_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -78,6 +84,9 @@ class SynPanoDataset(BaseDataset):
         scene_names: list | None = None,
         depth_max: float = 50.0,
         target_resolution: tuple | None = None,
+        require_depth: bool = True,
+        require_pose: bool = True,
+        placeholder_depth: float = 1.0,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -100,6 +109,9 @@ class SynPanoDataset(BaseDataset):
         self.scene_names = scene_names
         self.depth_max = float(depth_max)
         self.target_resolution = target_resolution
+        self.require_depth = bool(require_depth)
+        self.require_pose = bool(require_pose)
+        self.placeholder_depth = float(placeholder_depth)
 
         if split == "train":
             self.mode = "train"
@@ -125,7 +137,10 @@ class SynPanoDataset(BaseDataset):
             logging.warning("No SynPano trajectories found.")
 
         status = "Training" if self.training else "Testing"
-        logging.info(f"{status}: SynPano scenes={self.sequence_list_len}, len={len(self)}")
+        data_mode = self._index_mode_tag()
+        logging.info(
+            f"{status}: SynPano scenes={self.sequence_list_len}, len={len(self)}, mode={data_mode}"
+        )
 
     def __len__(self):
         return self.dataset_length
@@ -134,7 +149,10 @@ class SynPanoDataset(BaseDataset):
         cache_dir = osp.join(self.SynPano_DIR, "cache")
         os.makedirs(cache_dir, exist_ok=True)
         scene_tag = "all" if not self.scene_names else "_".join(sorted(self.scene_names))
-        cache_path = osp.join(cache_dir, f"SynPano_{self.mode}_{scene_tag}_index.json")
+        mode_tag = self._index_mode_tag()
+        cache_path = osp.join(
+            cache_dir, f"SynPano_{self.mode}_{scene_tag}_{mode_tag}_index.json"
+        )
 
         def build_fn():
             return self._build_index()
@@ -158,13 +176,13 @@ class SynPanoDataset(BaseDataset):
                 path = osp.join(self.SynPano_DIR, entry)
                 if not osp.isdir(path) or entry == "cache":
                     continue
-                if osp.isfile(osp.join(path, self.groundtruth_name)):
+                if self._is_valid_scene_dir(path):
                     scene_dirs.append(path)
 
         trajs = []
         for scene_dir in scene_dirs:
             scene_name = osp.basename(scene_dir)
-            frames = self._parse_groundtruth(osp.join(scene_dir, self.groundtruth_name))
+            frames = self._load_frames_for_scene(scene_dir)
             if len(frames) < self.min_num_images:
                 logging.warning(
                     f"Scene {scene_name} has {len(frames)} frames (< {self.min_num_images}), skip"
@@ -199,10 +217,71 @@ class SynPanoDataset(BaseDataset):
         if not trajs:
             raise RuntimeError(
                 f"No valid SynPano scenes under {self.SynPano_DIR}. "
-                f"Expected <scene>/images, depth, {self.groundtruth_name}"
+                f"Expected layout: <scene>/{self.images_subdir}/"
+                + (
+                    f" (+ {self.groundtruth_name}, depth/)"
+                    if self.require_pose or self.require_depth
+                    else ""
+                )
             )
         logging.info(f"SynPano indexed {len(trajs)} scene(s)")
         return trajs
+
+    def _index_mode_tag(self) -> str:
+        if not self.require_depth and not self.require_pose:
+            return "images_only"
+        if not self.require_depth:
+            return "rgbonly"
+        if not self.require_pose:
+            return "nopose"
+        return "full"
+
+    def _is_valid_scene_dir(self, scene_dir: str) -> bool:
+        if not osp.isdir(scene_dir):
+            return False
+        if self.require_pose:
+            if not osp.isfile(osp.join(scene_dir, self.groundtruth_name)):
+                return False
+        rgb_dir = osp.join(scene_dir, self.images_subdir)
+        if not osp.isdir(rgb_dir):
+            return False
+        return any(
+            osp.splitext(name)[1].lower() in _IMAGE_EXTS for name in os.listdir(rgb_dir)
+        )
+
+    def _load_frames_for_scene(self, scene_dir: str) -> list:
+        if self.require_pose:
+            gt_path = osp.join(scene_dir, self.groundtruth_name)
+            if not osp.isfile(gt_path):
+                logging.warning(f"Missing {self.groundtruth_name} for {scene_dir}")
+                return []
+            frames = self._parse_groundtruth(gt_path)
+            return self._filter_available_frames(scene_dir, frames)
+        return self._scan_image_frames(scene_dir)
+
+    def _scan_image_frames(self, scene_dir: str) -> list:
+        """Build frame list by scanning ``images/`` (identity placeholder poses)."""
+        rgb_dir = osp.join(scene_dir, self.images_subdir)
+        image_names = sorted(
+            name
+            for name in os.listdir(rgb_dir)
+            if osp.splitext(name)[1].lower() in _IMAGE_EXTS
+        )
+        identity_c2w = np.eye(4, dtype=np.float32).tolist()
+        frames = []
+        for frame_id, image_name in enumerate(image_names):
+            stem = osp.splitext(image_name)[0]
+            frames.append(
+                {
+                    "frame_id": frame_id,
+                    "image_name": image_name,
+                    "stem": stem,
+                    "c2w": identity_c2w,
+                }
+            )
+        scene_name = osp.basename(scene_dir)
+        logging.info(f"SynPano {scene_name}: scanned {len(frames)} image(s) (no poses)")
+        return frames
 
     def _parse_groundtruth(self, gt_path: str) -> list:
         frames = []
@@ -233,6 +312,26 @@ class SynPanoDataset(BaseDataset):
                     }
                 )
         return frames
+
+    def _filter_available_frames(self, scene_dir: str, frames: list) -> list:
+        """Keep frames whose RGB exists; when require_depth, also require a depth file."""
+        rgb_dir = osp.join(scene_dir, self.images_subdir)
+        kept = []
+        for frame in frames:
+            rgb_path = osp.join(rgb_dir, frame["image_name"])
+            if not osp.isfile(rgb_path):
+                continue
+            if self.require_depth and self._resolve_depth_path(scene_dir, frame["stem"]) is None:
+                continue
+            kept.append(frame)
+        dropped = len(frames) - len(kept)
+        if dropped > 0:
+            scene_name = osp.basename(scene_dir)
+            logging.info(
+                f"SynPano {scene_name}: indexed {len(kept)} frame(s), "
+                f"skipped {dropped} missing rgb/depth"
+            )
+        return kept
 
     def _resolve_depth_path(self, scene_dir: str, stem: str) -> str | None:
         depth_dir = osp.join(scene_dir, self.depth_subdir)
@@ -335,6 +434,11 @@ class SynPanoDataset(BaseDataset):
         d[~np.isfinite(d)] = 0.0
         return d[np.newaxis, ...]
 
+    def _placeholder_depth_map(self, target_resolution: tuple) -> np.ndarray:
+        h, w = target_resolution
+        d = np.full((h, w), self.placeholder_depth, dtype=np.float32)
+        return d[np.newaxis, ...]
+
     def get_data(
         self,
         seq_index=None,
@@ -402,14 +506,25 @@ class SynPanoDataset(BaseDataset):
             idx = int(idx)
             frame = frames[idx]
             rgb_path = osp.join(rgb_dir, frame["image_name"])
-            depth_path = self._resolve_depth_path(scene_dir, frame["stem"])
-            if not osp.isfile(rgb_path) or depth_path is None:
-                logging.debug(f"Missing rgb/depth for {scene}/{frame['image_name']}")
+            if not osp.isfile(rgb_path):
+                logging.debug(f"Missing rgb for {scene}/{frame['image_name']}")
                 continue
+            if self.require_depth:
+                depth_path = self._resolve_depth_path(scene_dir, frame["stem"])
+                if depth_path is None:
+                    logging.debug(
+                        f"Missing depth for {scene}/{frame['image_name']}"
+                    )
+                    continue
 
             try:
                 image = self._read_and_resize_image(rgb_path, target_resolution)
-                depth_map = self._read_and_resize_depth(depth_path, target_resolution)
+                if self.require_depth:
+                    depth_map = self._read_and_resize_depth(
+                        depth_path, target_resolution
+                    )
+                else:
+                    depth_map = self._placeholder_depth_map(target_resolution)
                 c2w = np.array(frame["c2w"], dtype=np.float32)
                 pose_w2c = _c2w_to_w2c(c2w)
                 R_delta = self._prepare_augmentation_params()
@@ -423,6 +538,10 @@ class SynPanoDataset(BaseDataset):
                     R_delta=R_delta,
                     depth_max=self.depth_max,
                 )
+                if not self.require_depth:
+                    frame_data["valid_mask"] = torch.ones_like(
+                        frame_data["valid_mask"], dtype=torch.bool
+                    )
 
                 batch_data["images"].append(frame_data["rgb"])
                 batch_data["depths"].append(frame_data["depth_tensor"])

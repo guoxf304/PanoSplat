@@ -20,6 +20,8 @@ from panovggt.render.coord_frame import (
     erp_ray_convention_note,
     prepare_anchor_world_means,
     prepare_render_gaussian_xyz,
+    rebuild_anchor_render_cloud,
+    rebuild_merged_render_cloud,
     resolve_axis_align_mode,
     resolve_scene_scale,
     subsample_hw,
@@ -33,6 +35,7 @@ from panovggt.render.odgs_bridge import (
     scale_gaussian_cloud_for_render,
 )
 from panovggt.utils.erp_loss import dssim_erp, l1_erp, ssim_erp
+from panovggt.utils.lpips_metric import lpips_loss
 from panovggt.utils.gs_debug import (
     gs_grad_core_should_run,
     gs_grad_print,
@@ -68,6 +71,8 @@ class GSLoss(nn.Module):
         lambda_geo: float = 0.1,
         lambda_dssim: float = 0.2,
         lambda_depth_consis: float = 0.0,
+        lambda_anti_leak: float = 0.0,
+        lambda_lpips: float = 0.0,
         render_views_per_step: int = 2,
         use_gt_pose: bool = False,
         gs_cross_view_axis_align: str = "none",
@@ -79,6 +84,8 @@ class GSLoss(nn.Module):
         self.lambda_geo = lambda_geo
         self.lambda_dssim = lambda_dssim
         self.lambda_depth_consis = lambda_depth_consis
+        self.lambda_anti_leak = lambda_anti_leak
+        self.lambda_lpips = lambda_lpips
         self.render_views_per_step = render_views_per_step
         self.use_gt_pose = use_gt_pose
         self.gs_cross_view_axis_align = resolve_axis_align_mode(gs_cross_view_axis_align)
@@ -131,6 +138,123 @@ class GSLoss(nn.Module):
         )
         return sanitize_gaussian_cloud(scaled)
 
+    def _try_rebuild_render_cloud(
+        self,
+        pred: Dict,
+        gt: Dict,
+        batch_idx: int,
+        *,
+        use_gt_mask: bool = True,
+    ):
+        """Rebuild render-aligned cloud from GS head features + world-frame means."""
+        adapter = pred.get("_gs_adapter_ref")
+        if adapter is None:
+            return None
+        if pred.get("gs_means_mode") == "merged":
+            return rebuild_merged_render_cloud(
+                adapter,
+                pred,
+                gt,
+                batch_idx,
+                use_gt_pose=self.use_gt_pose,
+                use_gt_mask=use_gt_mask,
+            )
+        return rebuild_anchor_render_cloud(
+            adapter,
+            pred,
+            gt,
+            batch_idx,
+            use_gt_pose=self.use_gt_pose,
+            use_gt_mask=use_gt_mask,
+        )
+
+    def prepare_render_bundle(
+        self, pred: Dict, gt_raw: Dict
+    ) -> tuple[Dict, Dict, torch.Tensor, torch.Tensor]:
+        """Shared GT/pred normalization for photometric loss, export, and inference."""
+        gt = self.geo_loss.prepare_gt(gt_raw)
+        merged_mode = pred.get("gs_means_mode") == "merged"
+
+        need_normalize = merged_mode or (
+            not self.use_gt_pose and self.lambda_geo == 0
+        )
+        pred_render = pred
+        if need_normalize:
+            pred_render = {
+                k: (v.clone() if torch.is_tensor(v) else v)
+                for k, v in pred.items()
+            }
+            self.geo_loss.normalize_pred(pred_render, gt)
+
+        # Merged cloud + render share pred-normalized frame (inference_gs.py).
+        if merged_mode:
+            norm_factor = resolve_scene_scale(pred_render, gt, None)
+        else:
+            norm_factor = resolve_scene_scale(pred_render, gt, gt_raw)
+
+        images = gt_raw["images"]
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        imgs_denorm = self._denorm_images(images)
+        gt["imgs"] = imgs_denorm
+        return pred_render, gt, norm_factor, imgs_denorm
+
+    def cloud_for_view_render(
+        self,
+        cloud: TensorGaussianCloud,
+        pred: Dict,
+        batch_idx: int,
+        view_idx: int,
+    ) -> TensorGaussianCloud:
+        """Apply cross-view axis alignment immediately before ``render_erp``."""
+        anchor_idx = (
+            int(pred["gs_anchor_idx"][batch_idx].item())
+            if pred.get("gs_anchor_idx") is not None
+            else int(view_idx)
+        )
+        xyz, rot = prepare_render_gaussian_xyz(
+            cloud.get_xyz,
+            cloud._rotation,
+            anchor_idx=anchor_idx,
+            view_idx=view_idx,
+            axis_align_mode=self.gs_cross_view_axis_align,
+        )
+        return TensorGaussianCloud(
+            xyz=xyz,
+            scaling=cloud._scaling,
+            rotation=rot,
+            opacity=cloud._opacity,
+            features_dc=cloud._features_dc,
+            features_rest=cloud._features_rest,
+            sh_degree=cloud.max_sh_degree,
+            active_sh_degree=cloud.active_sh_degree,
+        )
+
+    def build_render_camera(
+        self,
+        gt_raw: Dict,
+        gt: Dict,
+        pred_render: Dict,
+        batch_idx: int,
+        view_idx: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ):
+        merged_mode = pred_render.get("gs_means_mode") == "merged"
+        if (
+            self.use_gt_pose
+            and not merged_mode
+            and gt_raw.get("extrinsics") is not None
+        ):
+            w2c = gt_raw["extrinsics"][batch_idx, view_idx].float()
+            return build_erp_camera_from_w2c(w2c, height, width, device)
+        if merged_mode or not self.use_gt_pose:
+            poses = pred_render["camera_poses"]
+        else:
+            poses = gt["camera_poses"]
+        return build_erp_camera(poses[batch_idx, view_idx], height, width, device)
+
     def _build_aligned_cloud_xyz(
         self,
         pred: Dict,
@@ -140,9 +264,9 @@ class GSLoss(nn.Module):
     ) -> Optional[torch.Tensor]:
         """Replace Gaussian centers with GT world / local_points @ c2w, subsampled + masked."""
         if pred.get("gs_means_mode") == "merged":
-            # Adapter already voxel-fused all views; do not substitute raw merged pixels.
-            means = adapter_out[batch_idx].means
-            return means.float() if means.numel() > 0 else None
+            # Merged clouds must be rebuilt with per-view world means; adapter xyz
+            # lives in the model geometry frame and misaligns with GT cameras.
+            return None
 
         if pred.get("gs_anchor_idx") is None:
             return None
@@ -164,6 +288,60 @@ class GSLoss(nn.Module):
         if xyz.numel() == 0:
             return None
         return xyz.float()
+
+    def prepare_render_cloud_for_batch_item(
+        self,
+        pred: Dict,
+        gt: Dict,
+        adapter_out,
+        batch_idx: int,
+        norm_factor: torch.Tensor,
+    ):
+        """
+        Build a render-ready Gaussian cloud whose centers share the same world
+        frame as the render cameras (GT or normalized prediction).
+        """
+        cloud = self._try_rebuild_render_cloud(pred, gt, batch_idx, use_gt_mask=True)
+        if cloud is None or cloud.get_xyz.numel() == 0:
+            cloud = self._try_rebuild_render_cloud(
+                pred, gt, batch_idx, use_gt_mask=False
+            )
+
+        if cloud is None or cloud.get_xyz.numel() == 0:
+            if pred.get("gs_means_mode") == "merged":
+                logger.warning(
+                    "GT-aligned merged cloud rebuild failed for batch %s; "
+                    "skipping render/export for this item.",
+                    batch_idx,
+                )
+                return None
+            aligned_xyz = self._build_aligned_cloud_xyz(
+                pred, gt, adapter_out, batch_idx
+            )
+            if aligned_xyz is not None and aligned_xyz.numel() > 0:
+                cloud = self._prepare_render_cloud(
+                    adapter_out[batch_idx].cloud,
+                    norm_factor,
+                    batch_idx,
+                    aligned_xyz=aligned_xyz,
+                    xyz_already_normalized=True,
+                )
+            else:
+                cloud = adapter_out[batch_idx].cloud
+                cloud = self._prepare_render_cloud(
+                    cloud,
+                    norm_factor,
+                    batch_idx,
+                    xyz_already_normalized=not self.use_gt_pose,
+                )
+        else:
+            cloud = self._prepare_render_cloud(
+                cloud,
+                norm_factor,
+                batch_idx,
+                xyz_already_normalized=True,
+            )
+        return cloud
 
     def _scale_camera_poses(
         self,
@@ -195,6 +373,15 @@ class GSLoss(nn.Module):
             mode="bilinear",
             align_corners=True,
         ).squeeze(0).squeeze(0)
+
+    @staticmethod
+    def _render_alpha_from_pkg(pkg: Dict) -> torch.Tensor:
+        """Per-pixel accumulated coverage A from ODGS rasterizer (1 - transmittance)."""
+        if "render_alpha" in pkg:
+            return pkg["render_alpha"]
+        if "accuracy" in pkg:
+            return pkg["accuracy"]
+        raise KeyError("render pkg missing render_alpha / accuracy")
 
     def _geometry_base_depth(
         self,
@@ -256,7 +443,12 @@ class GSLoss(nn.Module):
             extrinsics_ok = False
             note = "use_gt_pose but gt_raw['extrinsics'] missing"
 
-        if self.use_gt_pose:
+        if pred.get("gs_means_mode") == "merged":
+            means_source = (
+                f"normalize_pred: local_points[{tensor_bi}, {cur_view_idx}] "
+                f"@ camera_poses[{tensor_bi}, {cur_view_idx}]"
+            )
+        elif self.use_gt_pose:
             means_source = f"world_points[{tensor_bi}, {anchor_idx}]"
         else:
             means_source = f"local_points[{tensor_bi}, {anchor_idx}] @ c2w[{anchor_idx}]"
@@ -355,7 +547,7 @@ class GSLoss(nn.Module):
         *,
         dataloader_batch_idx: int = 0,
         anchor_audit_dir: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         adapter_out = pred["gaussian_adapter_out"]
         b = gt_imgs.shape[0]
         device = gt_imgs.device
@@ -364,53 +556,28 @@ class GSLoss(nn.Module):
 
         total: Optional[torch.Tensor] = None
         depth_total: Optional[torch.Tensor] = None
+        anti_leak_total: Optional[torch.Tensor] = None
         count = 0
         depth_count = 0
+        anti_leak_count = 0
+        lpips_total: Optional[torch.Tensor] = None
+        lpips_count = 0
         trace: Dict[str, torch.Tensor] = {}
         debug = is_gs_grad_debug_enabled() and torch.is_grad_enabled()
         gstep = int(pred.get("gs_global_step", -1))
         anchor_records: List[AnchorViewAuditRecord] = []
 
         for bi in range(b):
-            cloud = adapter_out[bi].cloud
-            if cloud.get_xyz.numel() == 0:
+            cloud = self.prepare_render_cloud_for_batch_item(
+                pred, gt, adapter_out, bi, norm_factor
+            )
+            if cloud is None or cloud.get_xyz.numel() == 0:
                 continue
             cloud_raw = cloud
             anchor_idx = int(pred["gs_anchor_idx"][bi].item()) if pred.get("gs_anchor_idx") is not None else 0
-            base_aligned_xyz = self._build_aligned_cloud_xyz(pred, gt, adapter_out, bi)
             for vi in view_indices:
                 if vi >= poses.shape[1]:
                     continue
-                aligned_xyz = base_aligned_xyz
-                aligned_rot = cloud_raw._rotation
-                if aligned_xyz is None or aligned_xyz.numel() == 0:
-                    aligned_xyz = cloud_raw.get_xyz.float()
-                elif aligned_xyz.shape[0] != cloud_raw.get_xyz.shape[0]:
-                    logger.warning(
-                        "aligned_xyz count %s != cloud count %s; using cloud xyz",
-                        aligned_xyz.shape[0],
-                        cloud_raw.get_xyz.shape[0],
-                    )
-                    aligned_xyz = cloud_raw.get_xyz.float()
-                aligned_xyz, aligned_rot = prepare_render_gaussian_xyz(
-                    aligned_xyz,
-                    cloud_raw._rotation,
-                    anchor_idx=anchor_idx,
-                    view_idx=int(vi),
-                    axis_align_mode=self.gs_cross_view_axis_align,
-                    cross_view_only=True,
-                    align_rotation=True,
-                )
-                cloud = self._prepare_render_cloud(
-                    cloud_raw,
-                    norm_factor,
-                    bi,
-                    aligned_xyz=aligned_xyz,
-                    xyz_already_normalized=(
-                        base_aligned_xyz is not None and base_aligned_xyz.numel() > 0
-                    ),
-                    aligned_rotation=aligned_rot,
-                )
                 if debug and bi == 0 and gs_grad_verbose_should_run(gstep):
                     if vi == view_indices[0]:
                         gs_grad_print(
@@ -424,8 +591,6 @@ class GSLoss(nn.Module):
                         )
                         report_cloud("cloud_before_scale", cloud_raw, step=gstep)
                         report_cloud("cloud_after_scale", cloud, step=gstep)
-                if cloud.get_xyz.numel() == 0:
-                    continue
                 audit = self.build_anchor_view_record(
                     pred,
                     gt_raw,
@@ -461,15 +626,19 @@ class GSLoss(nn.Module):
                         audit.anchor_idx,
                         vi,
                     )
-                if self.use_gt_pose and gt_raw.get("extrinsics") is not None:
-                    w2c = gt_raw["extrinsics"][bi, vi].float()
-                    cam = build_erp_camera_from_w2c(
-                        w2c, gt_imgs.shape[-2], gt_imgs.shape[-1], device
-                    )
-                else:
-                    cam = build_erp_camera(poses[bi, vi], gt_imgs.shape[-2], gt_imgs.shape[-1], device)
+                view_cloud = self.cloud_for_view_render(cloud, pred, bi, vi)
+                cam = self.build_render_camera(
+                    gt_raw,
+                    gt,
+                    pred,
+                    bi,
+                    vi,
+                    gt_imgs.shape[-2],
+                    gt_imgs.shape[-1],
+                    device,
+                )
                 try:
-                    pkg = render_erp(cloud, cam, bg, pipe=self.render_pipe)
+                    pkg = render_erp(view_cloud, cam, bg, pipe=self.render_pipe)
                 except RuntimeError as exc:
                     logger.warning(
                         "ODGS render failed (batch=%s view=%s): %s",
@@ -528,6 +697,28 @@ class GSLoss(nn.Module):
                             else depth_total + depth_loss_v
                         )
                         depth_count += 1
+                if self.lambda_anti_leak > 0:
+                    rendered_alpha = self._align_depth_map(
+                        self._render_alpha_from_pkg(pkg).float(),
+                        target.shape[-2:],
+                    ).clamp(0.0, 1.0)
+                    anti_leak_v = F.mse_loss(
+                        rendered_alpha,
+                        torch.ones_like(rendered_alpha),
+                    )
+                    anti_leak_total = (
+                        anti_leak_v
+                        if anti_leak_total is None
+                        else anti_leak_total + anti_leak_v
+                    )
+                    anti_leak_count += 1
+                if self.lambda_lpips > 0:
+                    lpips_v = lpips_loss(rendered, target)
+                    if lpips_v.numel() > 0 and torch.isfinite(lpips_v):
+                        lpips_total = (
+                            lpips_v if lpips_total is None else lpips_total + lpips_v
+                        )
+                        lpips_count += 1
                 if debug and bi == 0 and count == 0 and gs_grad_verbose_should_run(gstep):
                     safe_retain_grad(rendered)
                     register_grad_hook(
@@ -558,7 +749,7 @@ class GSLoss(nn.Module):
             if debug and gs_grad_core_should_run(gstep):
                 gs_grad_print("render_path", step=gstep, status="fallback_gs_raw")
             zero = self._fallback_gs_loss(pred)
-            return zero, zero.new_zeros(())
+            return zero, zero.new_zeros(()), zero.new_zeros(()), zero.new_zeros(())
         if debug and gs_grad_core_should_run(gstep):
             if trace:
                 pred["_gs_grad_trace"] = trace
@@ -574,7 +765,15 @@ class GSLoss(nn.Module):
             loss_depth = depth_total / depth_count
         else:
             loss_depth = loss_rgb.new_zeros(())
-        return loss_rgb, loss_depth
+        if anti_leak_count > 0 and anti_leak_total is not None:
+            loss_anti_leak = anti_leak_total / anti_leak_count
+        else:
+            loss_anti_leak = loss_rgb.new_zeros(())
+        if lpips_count > 0 and lpips_total is not None:
+            loss_lpips = lpips_total / lpips_count
+        else:
+            loss_lpips = loss_rgb.new_zeros(())
+        return loss_rgb, loss_depth, loss_anti_leak, loss_lpips
 
     def _fallback_gs_loss(self, pred: Dict) -> torch.Tensor:
         """Differentiable fallback when no Gaussians survive masking / render."""
@@ -588,6 +787,88 @@ class GSLoss(nn.Module):
         )
         x = torch.nan_to_num(gs_raw.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         return x.pow(2).mean() * 1e-4
+
+    @torch.no_grad()
+    def build_tb_visual_batch(
+        self, pred: Dict, gt_raw: Dict
+    ) -> Dict[str, torch.Tensor]:
+        """Render GT / prediction / error maps for TensorBoard (all views, detached)."""
+        if not check_odgs_available() or "gaussians" not in pred:
+            return {}
+
+        pred_render, gt, norm_factor, imgs = self.prepare_render_bundle(pred, gt_raw)
+        adapter_out = pred_render.get("gaussian_adapter_out")
+        if not adapter_out:
+            return {}
+
+        if self.use_gt_pose:
+            poses = gt["camera_poses"]
+        else:
+            poses = pred_render.get("camera_poses")
+        if poses is None:
+            return {}
+
+        b, s = poses.shape[:2]
+        device = imgs.device
+        bg = self._bg.to(device=device, dtype=torch.float32)
+        gt_rows: List[torch.Tensor] = []
+        render_rows: List[torch.Tensor] = []
+        error_rows: List[torch.Tensor] = []
+
+        for bi in range(b):
+            cloud = self.prepare_render_cloud_for_batch_item(
+                pred_render, gt, adapter_out, bi, norm_factor
+            )
+            if cloud is None or cloud.get_xyz.numel() == 0:
+                continue
+
+            bi_gt: List[torch.Tensor] = []
+            bi_render: List[torch.Tensor] = []
+            bi_error: List[torch.Tensor] = []
+            for vi in range(s):
+                view_cloud = self.cloud_for_view_render(cloud, pred_render, bi, vi)
+                cam = self.build_render_camera(
+                    gt_raw,
+                    gt,
+                    pred_render,
+                    bi,
+                    vi,
+                    imgs.shape[-2],
+                    imgs.shape[-1],
+                    device,
+                )
+                try:
+                    pkg = render_erp(view_cloud, cam, bg, pipe=self.render_pipe)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "TB visual render failed (batch=%s view=%s): %s",
+                        bi,
+                        vi,
+                        exc,
+                    )
+                    continue
+
+                rendered = pkg["render"].float().clamp(0.0, 1.0)
+                target = imgs[bi, vi].float().clamp(0.0, 1.0)
+                error_map = torch.abs(rendered - target)
+                bi_gt.append(target)
+                bi_render.append(rendered)
+                bi_error.append(error_map)
+
+            if not bi_gt:
+                continue
+            gt_rows.append(torch.stack(bi_gt, dim=0))
+            render_rows.append(torch.stack(bi_render, dim=0))
+            error_rows.append(torch.stack(bi_error, dim=0))
+
+        if not gt_rows:
+            return {}
+
+        return {
+            "gt_rgb": torch.stack(gt_rows, dim=0),
+            "rendered_rgb": torch.stack(render_rows, dim=0),
+            "error_map": torch.stack(error_rows, dim=0),
+        }
 
     def forward(self, pred: Dict, gt_raw: Dict) -> Dict:
         loss_dict = {}
@@ -605,6 +886,8 @@ class GSLoss(nn.Module):
 
         loss_rgb = torch.zeros((), device=device, dtype=torch.float32)
         loss_depth_consis = torch.zeros((), device=device, dtype=torch.float32)
+        loss_anti_leak = torch.zeros((), device=device, dtype=torch.float32)
+        loss_lpips = torch.zeros((), device=device, dtype=torch.float32)
         gstep = int(pred.get("gs_global_step", -1))
         if is_gs_grad_debug_enabled() and gs_grad_verbose_should_run(gstep):
             gs_raw = pred.get("gs_raw")
@@ -642,21 +925,9 @@ class GSLoss(nn.Module):
             if not check_odgs_available():
                 raise ImportError("ODGS rasterizer required for photometric loss")
 
-            gt = self.geo_loss.prepare_gt(gt_raw)
-            norm_factor = resolve_scene_scale(pred, gt, gt_raw)
-
-            pred_render = pred
-            if not self.use_gt_pose and self.lambda_geo == 0:
-                pred_render = {
-                    k: (v.clone() if torch.is_tensor(v) else v)
-                    for k, v in pred.items()
-                }
-                self.geo_loss.normalize_pred(pred_render, gt)
-
-            images = gt_raw["images"]
-            if images.dim() == 4:
-                images = images.unsqueeze(0)
-            imgs_denorm = self._denorm_images(images)
+            pred_render, gt, norm_factor, imgs_denorm = self.prepare_render_bundle(
+                pred, gt_raw
+            )
 
             if self.use_gt_pose:
                 poses = gt["camera_poses"]
@@ -677,7 +948,7 @@ class GSLoss(nn.Module):
                     if a not in view_ids:
                         view_ids[0] = a
 
-            loss_rgb, loss_depth_consis = self._render_loss_for_views(
+            loss_rgb, loss_depth_consis, loss_anti_leak, loss_lpips = self._render_loss_for_views(
                 pred_render,
                 gt,
                 gt_raw,
@@ -694,6 +965,8 @@ class GSLoss(nn.Module):
             self.lambda_rgb * loss_rgb
             + self.lambda_geo * loss_geo
             + self.lambda_depth_consis * loss_depth_consis
+            + self.lambda_anti_leak * loss_anti_leak
+            + self.lambda_lpips * loss_lpips
         )
         if not torch.isfinite(loss_objective.detach().float().cpu()).all():
             logger.warning("Non-finite loss_objective; falling back to gs_raw regularizer.")
@@ -704,6 +977,14 @@ class GSLoss(nn.Module):
             loss_depth_consis.detach()
             if isinstance(loss_depth_consis, torch.Tensor)
             else loss_depth_consis
+        )
+        loss_dict["loss_anti_leak"] = (
+            loss_anti_leak.detach()
+            if isinstance(loss_anti_leak, torch.Tensor)
+            else loss_anti_leak
+        )
+        loss_dict["loss_lpips"] = (
+            loss_lpips.detach() if isinstance(loss_lpips, torch.Tensor) else loss_lpips
         )
         loss_dict["loss_objective"] = loss_objective
         if "loss_camera" not in loss_dict:

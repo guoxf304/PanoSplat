@@ -258,6 +258,7 @@ class Trainer:
         logging.info("Setting up components: Model, Loss, Logger, etc.")
         self.epoch = 0
         self.steps = {'train': 0, 'val': 0}
+        self._exported_visual_steps: set[int] = set()
 
         # TB writer / model / loss / clipper / scaler
         self.tb_writer = instantiate(self.logging_conf.tensorboard_writer, _recursive_=False)
@@ -448,6 +449,33 @@ class Trainer:
         export_epoch_gaussian_audit(self, phase="val")
         _safe_barrier(self.local_rank)
 
+    def _resolve_visual_export_steps(self) -> List[int]:
+        ve = getattr(self.logging_conf, "visual_export", None)
+        if ve is None:
+            return []
+        from train_utils.gs_epoch_infer import resolve_export_steps
+
+        return resolve_export_steps(ve)
+
+    def _maybe_export_at_train_steps(self) -> None:
+        """Rank-0 GS export at configured global steps (e.g. step 20)."""
+        ve = getattr(self.logging_conf, "visual_export", None)
+        if ve is None or not _cfg_get(ve, "enabled", False):
+            return
+        step = int(self.steps.get("train", 0))
+        if step not in self._resolve_visual_export_steps():
+            return
+        if step in self._exported_visual_steps:
+            return
+        if self.rank != 0:
+            _safe_barrier(self.local_rank)
+            return
+        from train_utils.gs_epoch_infer import export_epoch_train_inference
+
+        export_epoch_train_inference(self, None, step_override=step)
+        self._exported_visual_steps.add(step)
+        _safe_barrier(self.local_rank)
+
     def _maybe_export_epoch_train_inference(
         self, final_train_loss_meters: Dict[str, AverageMeter]
     ) -> None:
@@ -460,9 +488,14 @@ class Trainer:
         if self.rank != 0:
             _safe_barrier(self.local_rank)
             return
+        step = int(self.steps.get("train", 0))
+        if step in self._exported_visual_steps:
+            _safe_barrier(self.local_rank)
+            return
         from train_utils.gs_epoch_infer import export_epoch_train_inference
 
         export_epoch_train_inference(self, final_train_loss_meters)
+        self._exported_visual_steps.add(step)
         _safe_barrier(self.local_rank)
 
     def _maybe_export_erp_visuals(self) -> None:
@@ -722,6 +755,7 @@ class Trainer:
                 for optim in self.optims:
                     self.scaler.step(optim.optimizer)
                 self.scaler.update()
+                self._maybe_export_at_train_steps()
             else:
                 for optim in self.optims:
                     optim.zero_grad(set_to_none=True)
@@ -822,6 +856,7 @@ class Trainer:
         self._update_and_log_scalars(
             log_data, phase, step, loss_meters, loss_dict=loss_dict
         )
+        self._maybe_attach_gs_tb_visuals(log_data, phase, step)
         self._log_tb_visuals(log_data, phase, step)
         self.steps[phase] += 1
         return loss_dict
@@ -850,14 +885,33 @@ class Trainer:
                 phase, step, loss_dict=loss_dict, loss_meters=None
             )
 
-    def _log_tb_visuals(self, batch: Mapping, phase: str, step: int) -> None:
-        if not (
+    def _should_log_tb_visuals(self, phase: str, step: int) -> bool:
+        return bool(
             self.logging_conf.log_visuals
             and (phase in self.logging_conf.log_visual_frequency)
             and self.logging_conf.log_visual_frequency[phase] > 0
             and (step % self.logging_conf.log_visual_frequency[phase] == 0)
             and (self.logging_conf.visuals_keys_to_log is not None)
-        ):
+            and (phase in self.logging_conf.visuals_keys_to_log)
+        )
+
+    def _maybe_attach_gs_tb_visuals(
+        self, log_data: Dict[str, Any], phase: str, step: int
+    ) -> None:
+        if not self._should_log_tb_visuals(phase, step) or self.rank != 0:
+            return
+        from panovggt.models.loss_gs import GSLoss
+
+        if not isinstance(self.loss, GSLoss):
+            return
+        keys_to_log = self.logging_conf.visuals_keys_to_log[phase]["keys_to_log"]
+        gs_visual_keys = {"gt_rgb", "rendered_rgb", "error_map"}
+        if not gs_visual_keys.intersection(keys_to_log):
+            return
+        log_data.update(self.loss.build_tb_visual_batch(log_data, log_data))
+
+    def _log_tb_visuals(self, batch: Mapping, phase: str, step: int) -> None:
+        if not self._should_log_tb_visuals(phase, step) or self.rank != 0:
             return
 
         if phase in self.logging_conf.visuals_keys_to_log:

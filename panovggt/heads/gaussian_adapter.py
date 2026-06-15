@@ -8,7 +8,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
-from panovggt.render.odgs_bridge import TensorGaussianCloud, build_tensor_cloud, pack_sh_features
+from panovggt.render.odgs_bridge import TensorGaussianCloud, pack_sh_features
 from panovggt.utils.gs_debug import (
     gs_grad_print,
     gs_grad_verbose_should_run,
@@ -26,31 +26,49 @@ GS_SCALE_MAX = 0.05
 # Max axis / min axis; prevents needle-like "streak" Gaussians on flat regions.
 GS_MAX_ASPECT_RATIO = 4.0
 GS_OPACITY_FLOOR = 0.05
+# Log-scale inflation per fused point count inside a voxel (after softplus).
+GS_VOXEL_COUNT_SCALE_COEF = 0.1
 
-
-# Default 3D voxel grid size for Winner-Take-All voxelization (world units).
+# Default 3D voxel grid size for Micro-PointNet aggregation (world units).
 GS_VOXEL_SIZE = 0.02
 GS_RAW_FEAT_DIM = 11
 GS_CONF_CHANNEL = 11
+POINTNET_IN_DIM = GS_RAW_FEAT_DIM + 3
+
+
+def _scatter_add(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
+    """Per-voxel sum without torch_scatter."""
+    if src.dim() == 1:
+        out = torch.zeros(dim_size, device=src.device, dtype=src.dtype)
+        out.scatter_add_(0, index, src)
+        return out
+    feat_dim = src.shape[-1]
+    out = torch.zeros(dim_size, feat_dim, device=src.device, dtype=src.dtype)
+    out.scatter_add_(0, index.unsqueeze(-1).expand(-1, feat_dim), src)
+    return out
 
 
 def _scatter_max(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
-    """Per-voxel max without torch_scatter (PyTorch scatter_reduce)."""
+    """Per-voxel max without torch_scatter (1-D or row-wise)."""
+    if src.dim() == 1:
+        out = torch.full(
+            (dim_size,),
+            float("-inf"),
+            device=src.device,
+            dtype=src.dtype,
+        )
+        out.scatter_reduce_(0, index, src, reduce="amax", include_self=True)
+        return out
+    feat_dim = src.shape[-1]
     out = torch.full(
-        (dim_size,),
+        (dim_size, feat_dim),
         float("-inf"),
         device=src.device,
         dtype=src.dtype,
     )
-    out.scatter_reduce_(0, index, src, reduce="amax", include_self=True)
-    return out
-
-
-def _scatter_min(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
-    """Per-voxel min without torch_scatter (PyTorch scatter_reduce)."""
-    fill = float("inf") if src.is_floating_point() else torch.iinfo(src.dtype).max
-    out = torch.full((dim_size,), fill, device=src.device, dtype=src.dtype)
-    out.scatter_reduce_(0, index, src, reduce="amin", include_self=True)
+    out.scatter_reduce_(
+        0, index.unsqueeze(-1).expand(-1, feat_dim), src, reduce="amax", include_self=True
+    )
     return out
 
 
@@ -75,7 +93,7 @@ def _sample_rgb(images: torch.Tensor, stride: int) -> torch.Tensor:
 
 
 class PanoGaussianAdapterERP(torch.nn.Module):
-    """ERP / ODGS anisotropic Gaussian adapter."""
+    """ERP / ODGS anisotropic Gaussian adapter with Micro-PointNet voxel fusion."""
 
     def __init__(
         self,
@@ -99,61 +117,78 @@ class PanoGaussianAdapterERP(torch.nn.Module):
             persistent=False,
         )
 
+        self.pointnet_encoder = torch.nn.Sequential(
+            torch.nn.Linear(POINTNET_IN_DIM, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 64),
+            torch.nn.ReLU(),
+        )
+        self.pointnet_decoder = torch.nn.Sequential(
+            torch.nn.Linear(64, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, GS_RAW_FEAT_DIM),
+        )
+        torch.nn.init.zeros_(self.pointnet_decoder[-1].weight)
+        torch.nn.init.zeros_(self.pointnet_decoder[-1].bias)
+
     def voxelization_with_fusion(
         self,
         raw_feats: torch.Tensor,
         pts3d: torch.Tensor,
         voxel_size: float,
-        conf: torch.Tensor,
         rgb: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        3D voxelization with Winner-Take-All (WTA) selection.
+        Micro-PointNet voxel aggregation (permutation invariant).
 
-        Within each voxel, the pixel with the highest raw confidence fully
-        determines position, raw GS features, and RGB — no weighted averaging.
+        Shared MLP -> scatter_max pooling -> decoder MLP -> residual over mean features.
 
         Args:
-            raw_feats: (N, 11) pre-activation GS head output (density, scale, rot, sh).
+            raw_feats: (N, 11) pre-activation GS head output.
             pts3d: (N, 3) world coordinates.
             voxel_size: voxel edge length in world units.
-            conf: (N,) raw linear confidence (channel 11, pre-sigmoid).
-            rgb: optional (N, 3) image colors in [0, 1].
+            rgb: optional (N, 3) image colors; per-voxel mean is returned when set.
 
         Returns:
-            fused_pts: (M, 3)
+            voxel_pts_mean: (M, 3)
             fused_feats: (M, 11)
-            fused_rgb: (M, 3) or None
+            voxel_counts: (M, 1) number of source pixels per voxel
+            rgb_mean: (M, 3) or None
         """
         if pts3d.numel() == 0:
             empty_feats = raw_feats.new_zeros((0, raw_feats.shape[-1]))
             empty_pts = pts3d.new_zeros((0, 3))
+            empty_counts = raw_feats.new_zeros((0, 1))
             empty_rgb = None if rgb is None else rgb.new_zeros((0, 3))
-            return empty_pts, empty_feats, empty_rgb
+            return empty_pts, empty_feats, empty_counts, empty_rgb
 
         pts3d = pts3d.float()
         raw_feats = raw_feats.float()
-        conf = conf.float()
         if rgb is not None:
             rgb = rgb.float()
 
         voxel_indices = (pts3d / voxel_size).round().to(torch.int64)
-        _, inverse_indices = torch.unique(voxel_indices, dim=0, return_inverse=True)
-        num_voxels = int(inverse_indices.max().item()) + 1
-        num_points = pts3d.shape[0]
+        _, inverse_indices, counts = torch.unique(
+            voxel_indices, dim=0, return_inverse=True, return_counts=True
+        )
+        num_voxels = int(counts.shape[0])
+        counts_f = counts.to(raw_feats.dtype).unsqueeze(-1)
 
-        conf_voxel_max = _scatter_max(conf, inverse_indices, num_voxels)
-        is_max_conf = conf >= conf_voxel_max[inverse_indices] - 1e-6
+        voxel_pts_mean = _scatter_add(pts3d, inverse_indices, num_voxels) / counts_f
+        voxel_feats_mean = _scatter_add(raw_feats, inverse_indices, num_voxels) / counts_f
 
-        point_idx = torch.arange(num_points, device=pts3d.device, dtype=torch.int64)
-        sentinel = torch.full_like(point_idx, num_points)
-        candidate_idx = torch.where(is_max_conf, point_idx, sentinel)
-        winner_idx = _scatter_min(candidate_idx, inverse_indices, num_voxels)
+        delta_xyz = pts3d - voxel_pts_mean[inverse_indices]
+        pointnet_input = torch.cat([raw_feats, delta_xyz], dim=-1)
+        edge_feats = self.pointnet_encoder(pointnet_input)
+        voxel_global_feats = _scatter_max(edge_feats, inverse_indices, num_voxels)
+        voxel_residual = self.pointnet_decoder(voxel_global_feats)
+        fused_feats = voxel_feats_mean + voxel_residual
 
-        fused_pts = pts3d[winner_idx]
-        fused_feats = raw_feats[winner_idx]
-        fused_rgb = rgb[winner_idx] if rgb is not None else None
-        return fused_pts, fused_feats, fused_rgb
+        rgb_mean = None
+        if rgb is not None:
+            rgb_mean = _scatter_add(rgb, inverse_indices, num_voxels) / counts_f
+
+        return voxel_pts_mean, fused_feats, counts_f, rgb_mean
 
     def _build_cloud_from_raw(
         self,
@@ -161,6 +196,7 @@ class PanoGaussianAdapterERP(torch.nn.Module):
         raw_feats: torch.Tensor,
         rgb_base: torch.Tensor,
         global_step: int,
+        voxel_counts: Optional[torch.Tensor] = None,
     ) -> tuple[TensorGaussianCloud, torch.Tensor, torch.Tensor]:
         """Apply physical activations and safety clamps to fused or pixel-wise raw GS."""
         n = mu.shape[0]
@@ -188,9 +224,13 @@ class PanoGaussianAdapterERP(torch.nn.Module):
         )
         opacity = (opacity + GS_OPACITY_FLOOR).clamp(0.0, 1.0)
 
-        scales = (
-            GS_SCALE_BASE * F.softplus(scale_sel)
-        ).clamp(min=GS_SCALE_MIN, max=self.gs_scale_max)
+        scales = GS_SCALE_BASE * F.softplus(scale_sel)
+        if voxel_counts is not None:
+            fill = 1.0 + GS_VOXEL_COUNT_SCALE_COEF * torch.log(
+                voxel_counts.clamp(min=1.0)
+            )
+            scales = scales * fill
+        scales = scales.clamp(min=GS_SCALE_MIN, max=self.gs_scale_max)
         max_scale = torch.max(scales, dim=-1, keepdim=True)[0]
         min_allowed_scale = max_scale / GS_MAX_ASPECT_RATIO
         scales = torch.max(scales, min_allowed_scale)
@@ -237,7 +277,7 @@ class PanoGaussianAdapterERP(torch.nn.Module):
         point_mask: Optional[torch.Tensor],
         stride: int,
         detach_means: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Shared prep before flatten / voxelize (no activations applied)."""
         gs_out = torch.nan_to_num(gs_out.float(), nan=0.0, posinf=20.0, neginf=-20.0)
         while images.dim() > 4:
@@ -267,9 +307,6 @@ class PanoGaussianAdapterERP(torch.nn.Module):
             valid_geom = valid_geom[:, ::stride, ::stride]
 
         rgb_grid = _sample_rgb(images, 1)
-        conf_raw = torch.nan_to_num(
-            gs_out[:, GS_CONF_CHANNEL].float(), nan=0.0, posinf=0.0, neginf=0.0
-        )
 
         mask = valid_geom.clone()
         if point_mask is not None:
@@ -279,7 +316,7 @@ class PanoGaussianAdapterERP(torch.nn.Module):
                     f"point_mask shape {tuple(pm.shape)} != expected {tuple(mask.shape)}"
                 )
             mask = mask & pm
-        return gs_out, means, rgb_grid, conf_raw, mask
+        return gs_out, means, rgb_grid, mask
 
     @staticmethod
     def _resolve_batch_mask(
@@ -299,35 +336,32 @@ class PanoGaussianAdapterERP(torch.nn.Module):
         gs_out: torch.Tensor,
         means: torch.Tensor,
         rgb_grid: torch.Tensor,
-        conf_raw: torch.Tensor,
         mask: torch.Tensor,
         batch_idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Flatten one batch item to raw (N,11), pts, conf, rgb — pre-voxelization."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Flatten one batch item to raw (N,11), pts, rgb — pre-voxelization."""
         valid_geom = torch.isfinite(means).all(dim=-1)
         m = self._resolve_batch_mask(mask, valid_geom, batch_idx)
         raw_feats = gs_out[batch_idx, :GS_RAW_FEAT_DIM].permute(1, 2, 0)[m]
         pts = means[batch_idx][m]
-        conf = conf_raw[batch_idx][m]
         rgb = rgb_grid[batch_idx][m]
-        return raw_feats, pts, conf, rgb
+        return raw_feats, pts, rgb
 
     def build_gaussian_output_from_flat(
         self,
         raw_feats: torch.Tensor,
         pts: torch.Tensor,
-        conf: torch.Tensor,
         rgb: torch.Tensor,
         global_step: int,
     ) -> GaussianAdapterOutput:
         """Voxel-fuse (optional) flat GS buffers and apply physical activations."""
         n_in = int(pts.shape[0])
+        voxel_counts = None
         if self.gs_voxelize and n_in > 0:
-            mu, fused_feats, fused_rgb = self.voxelization_with_fusion(
+            mu, fused_feats, voxel_counts, fused_rgb = self.voxelization_with_fusion(
                 raw_feats,
                 pts,
                 self.gs_voxel_size,
-                conf,
                 rgb=rgb,
             )
             rgb_base = fused_rgb if fused_rgb is not None else rgb.new_zeros(
@@ -339,7 +373,7 @@ class PanoGaussianAdapterERP(torch.nn.Module):
             out_mask = torch.ones(n_in, device=pts.device, dtype=torch.bool)
 
         cloud, means_out, opacity = self._build_cloud_from_raw(
-            mu, fused_feats, rgb_base, global_step
+            mu, fused_feats, rgb_base, global_step, voxel_counts=voxel_counts
         )
         return GaussianAdapterOutput(
             cloud=cloud,
@@ -366,7 +400,7 @@ class PanoGaussianAdapterERP(torch.nn.Module):
             point_mask: (B, H, W) valid geometry mask.
         """
         b, _, h, w = gs_out.shape
-        gs_out, means, rgb_grid, conf_raw, mask = self._preprocess_view_gs(
+        gs_out, means, rgb_grid, mask = self._preprocess_view_gs(
             means,
             gs_out,
             images,
@@ -379,12 +413,12 @@ class PanoGaussianAdapterERP(torch.nn.Module):
         outputs: List[GaussianAdapterOutput] = []
 
         for bi in range(b):
-            raw_feats, pts, conf, rgb = self.flat_masked_gs_batch_item(
-                gs_out, means, rgb_grid, conf_raw, mask, bi
+            raw_feats, pts, rgb = self.flat_masked_gs_batch_item(
+                gs_out, means, rgb_grid, mask, bi
             )
             n_in = int(pts.shape[0])
             out = self.build_gaussian_output_from_flat(
-                raw_feats, pts, conf, rgb, global_step
+                raw_feats, pts, rgb, global_step
             )
             outputs.append(out)
             if is_gs_grad_debug_enabled() and bi == 0:

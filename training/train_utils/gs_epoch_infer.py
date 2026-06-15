@@ -11,20 +11,14 @@ import torch
 import torchvision
 
 from panovggt.models.loss_gs import GSLoss
-from panovggt.render.camera import build_erp_camera, build_erp_camera_from_w2c
-from panovggt.render.coord_frame import (
-    erp_ray_convention_note,
-    prepare_render_gaussian_xyz,
-    resolve_scene_scale,
-)
+from panovggt.render.coord_frame import erp_ray_convention_note
 from panovggt.render.odgs_bridge import check_odgs_available, render_erp
 from panovggt.utils.erp_loss import est_wsmap, l1_erp, ssim_erp
 from panovggt.utils.gs_ply_export import save_gaussian_splat_ply
+from panovggt.utils.lpips_metric import compute_lpips
 from train_utils.general import AverageMeter, copy_data_to_device
 
 logger = logging.getLogger(__name__)
-
-_lpips_model = None
 
 
 def _cfg_get(cfg: Any, key: str, default):
@@ -33,6 +27,18 @@ def _cfg_get(cfg: Any, key: str, default):
     if hasattr(cfg, "get"):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
+
+
+def resolve_export_steps(ve) -> List[int]:
+    """Optional mid-training export steps (e.g. ``[20]`` for early Gaussian checks)."""
+    if ve is None:
+        return []
+    raw = _cfg_get(ve, "export_steps", None)
+    if raw is None:
+        return []
+    if isinstance(raw, int):
+        return [int(raw)]
+    return sorted({int(s) for s in raw})
 
 
 def resolve_export_num_batches(trainer, dataloader, ve) -> int:
@@ -88,38 +94,6 @@ class EpochInferSummary:
         return sum(vals) / len(vals) if vals else 0.0
 
 
-def _get_lpips_model(device: torch.device):
-    global _lpips_model
-    if _lpips_model is None:
-        try:
-            from kornia.losses import LPIPS
-
-            _lpips_model = LPIPS().to(device).eval()
-        except Exception:
-            try:
-                import lpips as lpips_pkg
-
-                _lpips_model = lpips_pkg.LPIPS(net="alex").to(device).eval()
-            except Exception as exc:
-                logger.warning("LPIPS unavailable (%s); metrics will omit LPIPS.", exc)
-                _lpips_model = False
-    return _lpips_model
-
-
-def _compute_lpips(render: torch.Tensor, gt: torch.Tensor) -> float:
-    model = _get_lpips_model(render.device)
-    if not model:
-        return float("nan")
-    r = render.unsqueeze(0)
-    g = gt.unsqueeze(0)
-    with torch.no_grad():
-        if model.__class__.__module__.startswith("lpips"):
-            r = r * 2.0 - 1.0
-            g = g * 2.0 - 1.0
-        val = model(r, g)
-    return float(val.mean().item())
-
-
 def psnr_erp(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> float:
     ws = est_wsmap(pred)
     if ws.dim() == 2:
@@ -160,14 +134,20 @@ def _set_color_augmentation_enabled(trainer, enabled: bool) -> bool:
 def export_epoch_train_inference(
     trainer,
     final_train_loss_meters: Optional[Dict[str, AverageMeter]] = None,
+    *,
+    step_override: Optional[int] = None,
 ) -> Optional[EpochInferSummary]:
     """
-    Run GS inference on train batches at epoch end; save comparisons and metrics.
+    Run GS inference on train batches; save comparisons, gaussians.ply, and metrics.
+
+    Called at epoch end (``every_epoch``) and optionally at ``visual_export.export_steps``
+    (e.g. step 20) via ``step_override``.
 
     Output layout::
 
         output/<exp_name>/Epoch_{epoch:06d}_step_{step:06d}/
-            render_gt_images/view_{vi:02d}_compare.png
+            gaussians.ply
+            render_gt_images/batch{bi:02d}_view{vi:02d}_compare.png
             result.txt
     """
     if trainer.rank != 0:
@@ -193,7 +173,11 @@ def export_epoch_train_inference(
     render_all_views = bool(_cfg_get(ve, "render_all_views", True))
 
     epoch_display = int(trainer.epoch) + 1
-    global_step = int(trainer.steps.get("train", 0))
+    global_step = (
+        int(step_override)
+        if step_override is not None
+        else int(trainer.steps.get("train", 0))
+    )
     run_dir = os.path.join(
         output_root,
         f"Epoch_{epoch_display:06d}_step_{global_step:06d}",
@@ -271,24 +255,17 @@ def export_epoch_train_inference(
                 if lk.startswith("loss_"):
                     batch_loss_accum.setdefault(lk, []).append(float(lv.detach().float().item()))
 
-            gt = loss_fn.geo_loss.prepare_gt(batch)
-            norm_factor = resolve_scene_scale(pred, gt, batch)
-            imgs = loss_fn._denorm_images(batch["images"])
-            if not loss_fn.use_gt_pose and loss_fn.lambda_geo == 0:
-                pred_render = {
-                    k: (v.clone() if torch.is_tensor(v) else v)
-                    for k, v in pred.items()
-                }
-                loss_fn.geo_loss.normalize_pred(pred_render, gt)
-            else:
-                pred_render = pred
-            if loss_fn.use_gt_pose:
-                poses = gt["camera_poses"]
-            else:
-                poses = pred_render.get("camera_poses")
-                if poses is None:
-                    logger.warning("epoch_infer: missing camera_poses, skip batch %s.", batch_idx)
-                    continue
+            pred_render, gt, norm_factor, imgs = loss_fn.prepare_render_bundle(
+                pred, batch
+            )
+            poses = (
+                gt["camera_poses"]
+                if loss_fn.use_gt_pose
+                else pred_render.get("camera_poses")
+            )
+            if poses is None:
+                logger.warning("epoch_infer: missing camera_poses, skip batch %s.", batch_idx)
+                continue
             poses = poses.float()
 
             adapter_out = pred_render.get("gaussian_adapter_out")
@@ -302,14 +279,11 @@ def export_epoch_train_inference(
                 if cloud_raw.get_xyz.numel() == 0:
                     logger.warning("epoch_infer: empty cloud batch=%s bi=%s", batch_idx, bi)
                     continue
-                anchor_idx = (
-                    int(pred["gs_anchor_idx"][bi].item())
-                    if pred.get("gs_anchor_idx") is not None
-                    else 0
+                cloud = loss_fn.prepare_render_cloud_for_batch_item(
+                    pred_render, gt, adapter_out, bi, norm_factor
                 )
-                base_aligned_xyz = loss_fn._build_aligned_cloud_xyz(
-                    pred_render, gt, adapter_out, bi
-                )
+                if cloud is None or cloud.get_xyz.numel() == 0:
+                    continue
 
                 view_range = range(poses.shape[1]) if render_all_views else [0]
                 anchor = pred.get("gs_anchor_idx")
@@ -318,30 +292,6 @@ def export_epoch_train_inference(
 
                 for vi in view_range:
                     if vi >= poses.shape[1]:
-                        continue
-                    aligned_xyz = base_aligned_xyz
-                    if aligned_xyz is None or aligned_xyz.numel() == 0:
-                        aligned_xyz = cloud_raw.get_xyz.float()
-                    aligned_xyz, aligned_rot = prepare_render_gaussian_xyz(
-                        aligned_xyz,
-                        cloud_raw._rotation,
-                        anchor_idx=anchor_idx,
-                        view_idx=int(vi),
-                        axis_align_mode=loss_fn.gs_cross_view_axis_align,
-                        cross_view_only=True,
-                        align_rotation=True,
-                    )
-                    cloud = loss_fn._prepare_render_cloud(
-                        cloud_raw,
-                        norm_factor,
-                        bi,
-                        aligned_xyz=aligned_xyz,
-                        xyz_already_normalized=(
-                            base_aligned_xyz is not None and base_aligned_xyz.numel() > 0
-                        ),
-                        aligned_rotation=aligned_rot,
-                    )
-                    if cloud.get_xyz.numel() == 0:
                         continue
                     if not gaussian_ply_saved and batch_idx == 0 and bi == 0:
                         save_gaussian_splat_ply(
@@ -357,17 +307,21 @@ def export_epoch_train_inference(
                         global_step=global_step,
                     )
                     anchor_records.append(audit)
-                    if loss_fn.use_gt_pose and batch.get("extrinsics") is not None:
-                        w2c = batch["extrinsics"][bi, vi].float()
-                        cam = build_erp_camera_from_w2c(
-                            w2c, imgs.shape[-2], imgs.shape[-1], trainer.device
-                        )
-                    else:
-                        cam = build_erp_camera(
-                            poses[bi, vi], imgs.shape[-2], imgs.shape[-1], trainer.device
-                        )
+                    view_cloud = loss_fn.cloud_for_view_render(
+                        cloud, pred_render, bi, vi
+                    )
+                    cam = loss_fn.build_render_camera(
+                        batch,
+                        gt,
+                        pred_render,
+                        bi,
+                        vi,
+                        imgs.shape[-2],
+                        imgs.shape[-1],
+                        trainer.device,
+                    )
                     try:
-                        pkg = render_erp(cloud, cam, bg, pipe=pipe)
+                        pkg = render_erp(view_cloud, cam, bg, pipe=pipe)
                     except RuntimeError as exc:
                         logger.warning(
                             "epoch_infer: render failed batch=%s view=%s: %s",
@@ -393,7 +347,7 @@ def export_epoch_train_inference(
                         ssim=float(
                             ssim_erp(rendered.unsqueeze(0), target.unsqueeze(0)).item()
                         ),
-                        lpips=_compute_lpips(rendered, target),
+                        lpips=compute_lpips(rendered, target),
                     )
                     summary.render_metrics.append(metrics)
                     saved_views += 1

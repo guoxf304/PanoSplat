@@ -79,3 +79,35 @@ def l1_erp(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     if ws.dim() == 2:
         ws = ws.view(1, 1, *ws.shape)
     return (torch.abs(pred - gt) * ws).mean()
+
+
+def _psnr_from_mse(mse: torch.Tensor, max_val: float = 1.0) -> float:
+    mse_f = float(mse.detach().float().item())
+    if mse_f <= 0:
+        return float("inf")
+    return float(10.0 * torch.log10(torch.tensor(max_val**2) / mse_f).item())
+
+
+def _erp_sin_v_weights(pred: torch.Tensor) -> torch.Tensor:
+    """Per-pixel sin(v) weights (v = colatitude); equals cos(latitude) on ERP rows."""
+    ws = est_wsmap(pred)
+    if pred.dim() == 3:
+        return ws
+    if ws.dim() == 2:
+        return ws.unsqueeze(0)
+    return ws
+
+
+def psnr_uniform(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> float:
+    """Standard (uniform pixel) PSNR in dB."""
+    return _psnr_from_mse(((pred - gt) ** 2).mean(), max_val=max_val)
+
+
+def psnr_erp(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> float:
+    """ERP sin(v) / cos(latitude) weighted PSNR in dB."""
+    ws = _erp_sin_v_weights(pred).to(device=pred.device, dtype=pred.dtype)
+    err2 = (pred - gt) ** 2
+    if err2.dim() == 3:
+        err2 = err2.mean(dim=0)
+    mse = (err2 * ws).sum() / ws.sum().clamp(min=1e-8)
+    return _psnr_from_mse(mse, max_val=max_val)

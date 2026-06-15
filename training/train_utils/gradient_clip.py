@@ -49,7 +49,7 @@ class GradientClipper:
         """
         # First, collect all parameters that should be clipped based on module names
         params_to_clip_by_config = []
-        all_clipped_params = set()
+        all_clipped_param_ids: set[int] = set()
         
         for config in self.configs:
             current_config_params = []
@@ -58,20 +58,21 @@ class GradientClipper:
                     for module_name in config['module_names']:
                         if module_name in name:
                             current_config_params.append(param)
-                            all_clipped_params.add(param)
+                            all_clipped_param_ids.add(id(param))
                             break
             params_to_clip_by_config.append((config, current_config_params))
 
-        # Check for remaining parameters
+        # Check for remaining parameters (identity-based; Parameter `==` compares values).
         remaining_params = []
         for name, param in model.named_parameters():
-            if param.requires_grad and param not in all_clipped_params:
+            if param.requires_grad and id(param) not in all_clipped_param_ids:
                 remaining_params.append(param)
 
         if len(remaining_params) > 0:
+            remaining_ids = {id(p) for p in remaining_params}
             remaining_names = [
                 n for n, p in model.named_parameters()
-                if p.requires_grad and p in remaining_params
+                if p.requires_grad and id(p) in remaining_ids
             ]
             print(
                 f"Found {len(remaining_params)} parameters that won't be clipped: "

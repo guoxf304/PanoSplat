@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from panovggt.heads.dpt_gs_head import PanoDPT_GS_Head
 from panovggt.heads.gaussian_adapter import (
+    GS_RAW_FEAT_DIM,
     GaussianAdapterOutput,
     PanoGaussianAdapterERP,
     PanoGaussianAdapterPinhole,
@@ -17,6 +18,10 @@ from panovggt.heads.gaussian_adapter import (
     merge_gaussian_adapter_outputs,
 )
 from panovggt.models.panovggt_model import PanoVGGTModel
+from panovggt.render.coord_frame import (
+    batched_view_local_means,
+    transform_gaussian_adapter_output_c2w,
+)
 from panovggt.render.odgs_bridge import check_odgs_available
 from panovggt.utils.gs_debug import (
     gs_debug_hook_list,
@@ -42,8 +47,8 @@ class PanoVGGTGSModel(PanoVGGTModel):
     """
     PanoVGGT + AnySplat-style DPT Gaussian head + ODGS ERP adapter.
 
-    Geometry (mu) comes from global_points.  ``gs_means_mode='anchor'`` uses the
-    anchor frame only; ``gs_means_mode='merged'`` stacks all views (same as merged.ply).
+    Geometry (mu) from global_points (anchor) or per-view local geometry merged
+    to world via ``c2w`` (same rule as PanoVGGT ``merged.ply``).
     Appearance / scale / rotation / opacity from PanoDPT_GS_Head (per view in merged mode).
     """
 
@@ -284,11 +289,13 @@ class PanoVGGTGSModel(PanoVGGTModel):
         images: torch.Tensor,
         local_points: Optional[torch.Tensor],
         patch_start_idx: int,
+        means: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run DPT GS head for one view (raw gs_out, before adapter)."""
         device = images.device
         view_idx_tensor = torch.full((b,), view_idx, device=device, dtype=torch.long)
-        means = global_points[:, view_idx]
+        if means is None:
+            means = global_points[:, view_idx]
         hooks = self._prepare_dpt_encoder_tokens(hook_list, view_idx_tensor)
         images_view = images[:, view_idx]
         images_rgb = self._denormalize_images(images_view)
@@ -347,6 +354,7 @@ class PanoVGGTGSModel(PanoVGGTModel):
         patch_start_idx: int,
         anchor_idx: torch.Tensor,
         log_dbg: bool,
+        camera_poses: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, List[GaussianAdapterOutput]]:
         if self.gs_means_mode == "anchor":
             batch_idx = torch.arange(b, device=images.device)
@@ -385,14 +393,23 @@ class PanoVGGTGSModel(PanoVGGTModel):
             )
             if log_dbg:
                 gs_debug_print("gs.forward.out", gs_raw=gs_out, gs_means_mode="anchor")
-            return gs_out, adapter_out
+            return gs_out, adapter_out, None
 
-        per_batch_flats: List[List[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = [
+        per_batch_view_outs: List[List[GaussianAdapterOutput]] = [
             [] for _ in range(b)
         ]
         gs_out_views: List[torch.Tensor] = []
         adapter = self.gaussian_adapter
+        if camera_poses is None:
+            raise RuntimeError(
+                "merged gs_means_mode requires camera_poses for local→world merge"
+            )
         for vi in range(s):
+            means_v = batched_view_local_means(
+                vi,
+                local_points=local_points,
+                global_points=global_points,
+            )
             gs_out_v, means_v, images_rgb_v, point_mask_v = self._run_gs_head_for_view(
                 view_idx=vi,
                 b=b,
@@ -401,9 +418,10 @@ class PanoVGGTGSModel(PanoVGGTModel):
                 images=images,
                 local_points=local_points,
                 patch_start_idx=patch_start_idx,
+                means=means_v,
             )
             gs_out_views.append(gs_out_v)
-            gs_out_p, means_p, rgb_grid, conf_raw, mask = adapter._preprocess_view_gs(
+            gs_out_p, means_p, rgb_grid, mask = adapter._preprocess_view_gs(
                 means_v,
                 gs_out_v,
                 images_rgb_v,
@@ -413,25 +431,36 @@ class PanoVGGTGSModel(PanoVGGTModel):
             )
             for bi in range(b):
                 flat = adapter.flat_masked_gs_batch_item(
-                    gs_out_p, means_p, rgb_grid, conf_raw, mask, bi
+                    gs_out_p, means_p, rgb_grid, mask, bi
                 )
-                per_batch_flats[bi].append(flat)
+                view_out = adapter.build_gaussian_output_from_flat(
+                    flat[0], flat[1], flat[2], self.global_step
+                )
+                c2w = camera_poses[bi, vi].float()
+                per_batch_view_outs[bi].append(
+                    transform_gaussian_adapter_output_c2w(view_out, c2w)
+                )
             del gs_out_v, means_v, images_rgb_v, point_mask_v, gs_out_p, means_p
             if vi + 1 < s and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         merged_out: List[GaussianAdapterOutput] = []
         for bi in range(b):
-            flats = per_batch_flats[bi]
-            raw_feats = torch.cat([f[0] for f in flats], dim=0)
-            pts = torch.cat([f[1] for f in flats], dim=0)
-            conf = torch.cat([f[2] for f in flats], dim=0)
-            rgb = torch.cat([f[3] for f in flats], dim=0)
-            merged_out.append(
-                adapter.build_gaussian_output_from_flat(
-                    raw_feats, pts, conf, rgb, self.global_step
+            views = per_batch_view_outs[bi]
+            if not views:
+                empty = global_points.new_zeros((0, 3))
+                merged_out.append(
+                    adapter.build_gaussian_output_from_flat(
+                        global_points.new_zeros((0, GS_RAW_FEAT_DIM)),
+                        empty,
+                        empty,
+                        self.global_step,
+                    )
                 )
-            )
+            elif len(views) == 1:
+                merged_out.append(views[0])
+            else:
+                merged_out.append(merge_gaussian_adapter_outputs(views))
         gs_out = gs_out_views[int(anchor_idx[0].item())] if gs_out_views else gs_out_views[0]
         if log_dbg:
             gs_debug_print(
@@ -440,7 +469,7 @@ class PanoVGGTGSModel(PanoVGGTModel):
                 num_views=s,
                 total_gaussians=sum(int(o.means.shape[0]) for o in merged_out),
             )
-        return gs_out, merged_out
+        return gs_out, merged_out, gs_out_views
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         # Normalize to (B, S, 3, H, W) before super() so aggregator and GS share batch size.
@@ -486,6 +515,7 @@ class PanoVGGTGSModel(PanoVGGTModel):
             raise RuntimeError("global_points required for Gaussian branch")
 
         local_points = predictions.get("local_points")
+        camera_poses = predictions.get("camera_poses")
         patch_start_idx = getattr(self.aggregator, "patch_start_idx", 0)
 
         if log_dbg:
@@ -510,7 +540,7 @@ class PanoVGGTGSModel(PanoVGGTModel):
             gs_debug_hook_list("aggregated_hooks(raw)", hook_list)
 
         with torch.amp.autocast(device_type="cuda", enabled=False):
-            gs_out, adapter_out = self._build_gaussian_outputs(
+            gs_out, adapter_out, gs_raw_views = self._build_gaussian_outputs(
                 b=b,
                 s=s,
                 global_points=global_points,
@@ -520,6 +550,7 @@ class PanoVGGTGSModel(PanoVGGTModel):
                 patch_start_idx=patch_start_idx,
                 anchor_idx=anchor_idx,
                 log_dbg=log_dbg,
+                camera_poses=camera_poses,
             )
             if is_gs_grad_debug_enabled() and torch.is_grad_enabled():
                 c = adapter_out[0].cloud if adapter_out else None
@@ -553,9 +584,12 @@ class PanoVGGTGSModel(PanoVGGTModel):
                         )
         predictions["gs_raw"] = gs_out
         predictions["gs_conf"] = gs_out[:, 11:12]
+        if gs_raw_views is not None:
+            predictions["gs_raw_views"] = gs_raw_views
         predictions["gaussian_adapter_out"] = adapter_out
         predictions["gaussians"] = [o.cloud for o in adapter_out]
         predictions["gs_global_step"] = self.global_step
         predictions["gs_stride"] = self.gs_stride
+        predictions["_gs_adapter_ref"] = self.gaussian_adapter
 
         return predictions
