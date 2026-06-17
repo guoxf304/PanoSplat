@@ -525,7 +525,6 @@ class Trainer:
         dataloader = self.val_dataset.get_loader(epoch=self.epoch)
         final_val_loss_meters = self.val_epoch(dataloader)
         self._log_epoch_metrics(final_val_loss_meters, 'val', self.epoch)
-        self._maybe_run_gaussian_audit()
 
         del dataloader, final_val_loss_meters
         gc.collect()

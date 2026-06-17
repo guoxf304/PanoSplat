@@ -103,8 +103,17 @@ def psnr_uniform(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> 
     return _psnr_from_mse(((pred - gt) ** 2).mean(), max_val=max_val)
 
 
+def ws_psnr(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> float:
+    """WS-PSNR: sin(v)-weighted MSE averaged over all C×H×W pixels."""
+    ws = est_wsmap(pred)
+    if ws.dim() == 2:
+        ws = ws.view(1, 1, *ws.shape)
+    mse = ((pred - gt) ** 2 * ws).mean()
+    return _psnr_from_mse(mse, max_val=max_val)
+
+
 def psnr_erp(pred: torch.Tensor, gt: torch.Tensor, max_val: float = 1.0) -> float:
-    """ERP sin(v) / cos(latitude) weighted PSNR in dB."""
+    """ERP-PSNR: RGB-averaged per-pixel MSE, sin(v)-weighted by sum(w)."""
     ws = _erp_sin_v_weights(pred).to(device=pred.device, dtype=pred.dtype)
     err2 = (pred - gt) ** 2
     if err2.dim() == 3:

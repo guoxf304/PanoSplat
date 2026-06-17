@@ -198,47 +198,63 @@ class Aggregator(nn.Module):
         if hasattr(self.patch_embed, "mask_token"):
             delattr(self.patch_embed, "mask_token")
 
+    def _load_dinov2_into_patch_embed(self, state, model_dict, source: str) -> bool:
+        if isinstance(state, dict) and "teacher" in state:
+            state = state["teacher"]
+        matched = {
+            k: v for k, v in state.items()
+            if k in model_dict and v.shape == model_dict[k].shape
+        }
+        logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from {source}")
+        if not matched:
+            return False
+        model_dict.update(matched)
+        self.patch_embed.load_state_dict(model_dict)
+        return True
+
     def _try_load_dinov2(self, hub_name: str, url: Optional[str], patch_embed_key: str):
-        """Try loading DINOv2 weights via torch.hub, then fallback to direct download."""
+        """Load DINOv2 weights: local cache first, then torch.hub, then URL download."""
         success = False
         model_dict = self.patch_embed.state_dict()
+        weights_dir = Path(os.path.expanduser("~/.cache/panovggt/weights"))
+        local_path = weights_dir / f"{patch_embed_key}_pretrain.pth"
 
-        # Method 1: torch.hub
-        try:
-            logger.info(f"Loading DINOv2 weights for {hub_name} via torch.hub")
-            pretrained = torch.hub.load("facebookresearch/dinov2", hub_name)
-            matched = {
-                k: v for k, v in pretrained.state_dict().items()
-                if k in model_dict and v.shape == model_dict[k].shape
-            }
-            logger.info(f"Matched {len(matched)}/{len(model_dict)} layers from torch.hub")
-            model_dict.update(matched)
-            self.patch_embed.load_state_dict(model_dict)
-            success = True
-        except Exception as e:
-            logger.warning(f"torch.hub load failed: {e}")
+        # Method 1: local cache (avoids slow/hung GitHub access via torch.hub)
+        if local_path.exists():
+            try:
+                logger.info(f"Loading DINOv2 weights from local cache: {local_path}")
+                state = torch.load(local_path, map_location="cpu")
+                success = self._load_dinov2_into_patch_embed(
+                    state, model_dict, source=str(local_path)
+                )
+            except Exception as e:
+                logger.warning(f"Local DINOv2 cache load failed: {e}")
 
-        # Method 2: Direct download
+        # Method 2: torch.hub
+        if not success:
+            try:
+                logger.info(f"Loading DINOv2 weights for {hub_name} via torch.hub")
+                pretrained = torch.hub.load("facebookresearch/dinov2", hub_name)
+                success = self._load_dinov2_into_patch_embed(
+                    pretrained.state_dict(), model_dict, source="torch.hub"
+                )
+            except Exception as e:
+                logger.warning(f"torch.hub load failed: {e}")
+
+        # Method 3: Direct download
         if not success and url:
             try:
                 logger.info(f"Downloading DINOv2 weights from {url}")
-                weights_dir = Path(os.path.expanduser("~/.cache/panovggt/weights"))
                 weights_dir.mkdir(parents=True, exist_ok=True)
-                local_path = weights_dir / f"{patch_embed_key}_pretrain.pth"
                 if not local_path.exists():
-                    r = requests.get(url, allow_redirects=True)
+                    r = requests.get(url, allow_redirects=True, timeout=120)
+                    r.raise_for_status()
                     with open(local_path, "wb") as f:
                         f.write(r.content)
                 state = torch.load(local_path, map_location="cpu")
-                if "teacher" in state:
-                    state = state["teacher"]
-                matched = {
-                    k: v for k, v in state.items()
-                    if k in model_dict and v.shape == model_dict[k].shape
-                }
-                model_dict.update(matched)
-                self.patch_embed.load_state_dict(model_dict)
-                success = True
+                success = self._load_dinov2_into_patch_embed(
+                    state, model_dict, source=str(local_path)
+                )
             except Exception as e:
                 logger.warning(f"Direct download failed: {e}")
 

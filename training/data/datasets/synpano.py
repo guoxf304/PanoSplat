@@ -158,6 +158,73 @@ class SynPanoDataset(BaseDataset):
             return self._build_index()
 
         self.trajectories = load_or_build_json_cache(cache_path, build_fn)
+        self.trajectories = self._validate_trajectories_on_disk(self.trajectories)
+
+    def _rgb_path_for_frame(self, scene_dir: str, frame: dict) -> str:
+        return osp.join(scene_dir, self.images_subdir, frame["image_name"])
+
+    def _existing_frame_indices(self, traj: dict) -> list[int]:
+        scene_dir = traj["scene_dir"]
+        indices = []
+        for i, frame in enumerate(traj["frames"]):
+            if osp.isfile(self._rgb_path_for_frame(scene_dir, frame)):
+                if not self.require_depth or self._resolve_depth_path(
+                    scene_dir, frame["stem"]
+                ) is not None:
+                    indices.append(i)
+        return indices
+
+    def _validate_trajectories_on_disk(self, trajs: list) -> list:
+        """Drop missing RGB/depth entries from cached trajectories (stale index fix)."""
+        refreshed = []
+        for traj in trajs:
+            scene = traj["scene"]
+            scene_dir = traj["scene_dir"]
+            rgb_dir = osp.join(scene_dir, self.images_subdir)
+            if not osp.isdir(rgb_dir):
+                logging.warning("SynPano %s: missing images dir, skip", scene)
+                continue
+
+            kept_frames = []
+            for frame in traj["frames"]:
+                rgb_path = osp.join(rgb_dir, frame["image_name"])
+                if not osp.isfile(rgb_path):
+                    continue
+                if self.require_depth and self._resolve_depth_path(
+                    scene_dir, frame["stem"]
+                ) is None:
+                    continue
+                kept_frames.append(frame)
+
+            dropped = len(traj["frames"]) - len(kept_frames)
+            if dropped > 0:
+                logging.info(
+                    "SynPano %s: refreshed index %s -> %s frame(s) on disk",
+                    scene,
+                    len(traj["frames"]),
+                    len(kept_frames),
+                )
+
+            if len(kept_frames) < self.min_num_images:
+                logging.warning(
+                    "SynPano %s: only %s readable frame(s) (< %s), skip",
+                    scene,
+                    len(kept_frames),
+                    self.min_num_images,
+                )
+                continue
+
+            traj_out = dict(traj)
+            traj_out["frames"] = kept_frames
+            refreshed.append(traj_out)
+
+        if not refreshed:
+            raise RuntimeError(
+                "No valid SynPano trajectories after refreshing cached indices. "
+                "Check datasets/SynPano/<scene>/images/ or delete stale cache under "
+                f"{osp.join(self.SynPano_DIR, 'cache')}."
+            )
+        return refreshed
 
     def _build_index(self) -> list:
         if not osp.isdir(self.SynPano_DIR):
@@ -439,6 +506,44 @@ class SynPanoDataset(BaseDataset):
         d = np.full((h, w), self.placeholder_depth, dtype=np.float32)
         return d[np.newaxis, ...]
 
+    def _sample_replace(self, count: int, pool_size: int) -> bool:
+        return bool(self.allow_duplicate_img) and count > pool_size
+
+    def _choose_frame_ids(self, valid_indices: list[int], count: int) -> list[int]:
+        count = min(int(count), len(valid_indices))
+        if count <= 0:
+            raise ValueError("count must be positive")
+        replace = self._sample_replace(count, len(valid_indices))
+        picked = np.random.choice(valid_indices, count, replace=replace)
+        return [int(i) for i in np.atleast_1d(picked)]
+
+    def _ensure_unique_frame_ids(
+        self,
+        ids: list,
+        valid_indices: list[int],
+        target_count: int,
+    ) -> list[int]:
+        """Drop duplicates and pad from unused frames when the pool is large enough."""
+        target_count = min(int(target_count), len(valid_indices))
+        valid_set = set(int(i) for i in valid_indices)
+        unique: list[int] = []
+        used: set[int] = set()
+        for raw in ids:
+            idx = int(raw)
+            if idx in valid_set and idx not in used:
+                unique.append(idx)
+                used.add(idx)
+        remaining = [i for i in valid_indices if i not in used]
+        need = target_count - len(unique)
+        if need > 0 and remaining:
+            pick = np.random.choice(
+                remaining,
+                min(need, len(remaining)),
+                replace=False,
+            )
+            unique.extend(int(i) for i in np.atleast_1d(pick))
+        return unique
+
     def get_data(
         self,
         seq_index=None,
@@ -446,6 +551,7 @@ class SynPanoDataset(BaseDataset):
         aspect_ratio=1.0,
         ids=None,
         seq_name=None,
+        geom_aug_R_delta=None,
     ):
         if self.sequence_list_len == 0:
             raise RuntimeError("SynPanoDataset has no trajectories.")
@@ -459,26 +565,35 @@ class SynPanoDataset(BaseDataset):
         frames = traj["frames"]
         orig_resolution = tuple(traj["resolution"])
         n_frames = len(frames)
-        valid_indices = list(range(n_frames))
+        valid_indices = self._existing_frame_indices(traj)
+        if len(valid_indices) < 2:
+            raise RuntimeError(
+                f"SynPano scene {scene} has {len(valid_indices)} readable frame(s); "
+                "need at least 2."
+            )
 
         if img_per_seq is None:
-            img_per_seq = random.randint(2, min(24, n_frames))
-        img_per_seq = min(img_per_seq, n_frames)
+            img_per_seq = random.randint(2, min(24, len(valid_indices)))
+        img_per_seq = min(img_per_seq, len(valid_indices))
 
         if ids is None:
-            ids = np.random.choice(
-                valid_indices, img_per_seq, replace=self.allow_duplicate_img
-            ).tolist()
+            ids = self._choose_frame_ids(valid_indices, img_per_seq)
 
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, n_frames, expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) in valid_indices]
             if len(ids) < 2:
-                ids = np.random.choice(
+                ids = self._choose_frame_ids(
                     valid_indices,
-                    max(2, min(img_per_seq, n_frames)),
-                    replace=self.allow_duplicate_img,
-                ).tolist()
+                    max(2, min(img_per_seq, len(valid_indices))),
+                )
+
+        ids = self._ensure_unique_frame_ids(ids, valid_indices, img_per_seq)
+        if len(ids) < 2:
+            ids = self._choose_frame_ids(
+                valid_indices,
+                max(2, min(img_per_seq, len(valid_indices))),
+            )
 
         if self.target_resolution is not None:
             target_resolution = tuple(self.target_resolution)
@@ -487,6 +602,28 @@ class SynPanoDataset(BaseDataset):
 
         equi_rotate = self._get_equi_rotate(target_resolution[0])
         rgb_dir = osp.join(scene_dir, self.images_subdir)
+        # One ERP geom-aug rotation per sequence (matches inference_gs rebuild).
+        if geom_aug_R_delta is not None:
+            if torch.is_tensor(geom_aug_R_delta):
+                R_delta = geom_aug_R_delta.detach().cpu().float()
+            else:
+                R_delta = torch.tensor(geom_aug_R_delta, dtype=torch.float32)
+            if (
+                R_delta.dim() == 3
+                and R_delta.shape[0] == 1
+                and R_delta.shape[1:] == (3, 3)
+            ):
+                R_delta = R_delta[0]
+            if R_delta.shape != (3, 3):
+                raise ValueError(
+                    f"geom_aug_R_delta must be (3, 3), got {tuple(R_delta.shape)}"
+                )
+            # Match process_one_image: skip rotation when identity.
+            eye = torch.eye(3, dtype=R_delta.dtype)
+            if torch.allclose(R_delta, eye, atol=1e-5, rtol=0.0):
+                R_delta = None
+        else:
+            R_delta = self._prepare_augmentation_params()
 
         batch_data = {
             k: []
@@ -498,6 +635,7 @@ class SynPanoDataset(BaseDataset):
                 "world_points",
                 "point_masks",
                 "original_sizes",
+                "frame_stems",
             ]
         }
         successful_ids = []
@@ -527,7 +665,6 @@ class SynPanoDataset(BaseDataset):
                     depth_map = self._placeholder_depth_map(target_resolution)
                 c2w = np.array(frame["c2w"], dtype=np.float32)
                 pose_w2c = _c2w_to_w2c(c2w)
-                R_delta = self._prepare_augmentation_params()
 
                 frame_data = self.process_one_image(
                     image=image,
@@ -550,6 +687,7 @@ class SynPanoDataset(BaseDataset):
                 batch_data["world_points"].append(frame_data["world_coords"])
                 batch_data["point_masks"].append(frame_data["valid_mask"])
                 batch_data["original_sizes"].append(np.array(orig_resolution))
+                batch_data["frame_stems"].append(frame["stem"])
                 successful_ids.append(idx)
             except Exception as e:
                 logging.warning(
@@ -558,16 +696,37 @@ class SynPanoDataset(BaseDataset):
                 continue
 
         if len(batch_data["images"]) < 2:
-            logging.error("Not enough valid SynPano frames, retrying sample...")
+            if len(valid_indices) < 2:
+                raise RuntimeError(
+                    f"SynPano scene {scene} has fewer than 2 readable frames."
+                )
+            fallback_ids = self._choose_frame_ids(
+                valid_indices,
+                min(2, len(valid_indices)),
+            )
+            logging.warning(
+                "SynPano %s: resampling frame ids %s -> %s",
+                scene,
+                ids,
+                fallback_ids,
+            )
             return self.get_data(
                 seq_index=seq_index,
                 img_per_seq=img_per_seq,
                 aspect_ratio=aspect_ratio,
+                ids=fallback_ids,
             )
 
-        return {
+        payload = {
             "seq_name": f"SynPano_{scene}",
             "ids": successful_ids,
             "frame_num": len(batch_data["extrinsics"]),
+            # Always present so default_collate never KeyErrors across batch items.
+            "geom_aug_R_delta": (
+                R_delta
+                if R_delta is not None
+                else torch.eye(3, dtype=torch.float32)
+            ),
             **batch_data,
         }
+        return payload

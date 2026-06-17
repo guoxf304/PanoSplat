@@ -6,7 +6,7 @@ defaults:
   - panovggt_gs
   - _self_
 
-exp_name: synpano_gs_0615_1447
+exp_name: synpano_gs_0616_1802
 
 SynPano_DIR: /mnt/gxf/PanoSplat/datasets/SynPano
 
@@ -23,7 +23,7 @@ val_epoch_freq: 1
 
 logging:
   log_dir: ./logs
-  log_visuals: true
+  log_visuals: false
   log_visual_frequency:
     train: 100
   visuals_per_batch_to_log: 2
@@ -51,8 +51,10 @@ logging:
     # Extra exports at these global steps (e.g. early Gaussian sanity check).
     export_steps: [20]
     # null / all / -1: export every batch in the epoch dataloader
-    num_batches: 5
+    num_batches: 1
     render_all_views: true
+    # When false (default), export every sample in a collated train batch (e.g. B=2 → 4 views).
+    export_sample_only: false
   scalar_keys_to_log:
     train:
       keys_to_log:
@@ -109,6 +111,7 @@ data:
     common_config:
       img_nums: [2, 2]
       fix_img_num: 2
+      allow_duplicate_img: false
       get_nearby: true
       augs:
         color_aug: true
@@ -125,7 +128,7 @@ data:
         - _target_: data.datasets.synpano.SynPanoDataset
           split: train
           SynPano_DIR: ${SynPano_DIR}
-          scene_names: ['apartment_2']
+          scene_names: ['barbershop_2']
           #scene_names: ['apartment','archiviz-flat','barbershop','classroom','jodo','livingroom','meetingroom','restroom','washroom']
           len_train: 1200
           get_nearby: true
@@ -139,6 +142,7 @@ data:
     common_config:
       img_nums: [2, 2]
       fix_img_num: 2
+      allow_duplicate_img: false
       training: false
       augs:
         color_aug: false
