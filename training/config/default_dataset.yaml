@@ -14,7 +14,7 @@ data:
 
     common_config:
       # Basic parameters
-      img_size: 336
+      img_size: 518
       patch_size: 14
       training: True
       debug: False
@@ -47,9 +47,6 @@ data:
       # Data augmentation
       augs:
         color_aug: True
-        rand_gamma:
-          min: 0.8
-          max: 1.2
         aspects: [0.5, 1.0]
         pitch:    # +/- degrees, 0 means disabled
           sample_angle: 15.0  # +/- degrees, 0 means disabled
@@ -69,12 +66,12 @@ data:
     max_img_per_gpu: 48
     shuffle: False
     pin_memory: False
-    drop_last: False
+    drop_last: True
     persistent_workers: False
     seed: 42
 
     common_config:
-      img_size: 336
+      img_size: 518
       patch_size: 14
       training: False
       debug: False

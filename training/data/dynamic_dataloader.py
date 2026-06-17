@@ -15,6 +15,14 @@ from abc import ABC, abstractmethod
 from .worker_fn import get_worker_init_fn
 
 
+def _common_cfg_get(common_config, key: str, default):
+    if common_config is None:
+        return default
+    if hasattr(common_config, "get"):
+        return common_config.get(key, default)
+    return getattr(common_config, key, default)
+
+
 class DynamicTorchDataset(ABC):
     def __init__(
             self,
@@ -56,14 +64,25 @@ class DynamicTorchDataset(ABC):
                 self.image_num_range[1]:
             raise ValueError(f"image_num_range must be [min, max] with 1 <= min <= max, got {self.image_num_range}")
 
-        # Create samplers
-        self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle)
+        fix_img_num = int(_common_cfg_get(common_config, "fix_img_num", -1))
+        fix_aspect_ratio = float(_common_cfg_get(common_config, "fix_aspect_ratio", -1.0))
+
+        # Create samplers (val: shuffle=False -> deterministic batches + drop_last)
+        self.sampler = DynamicDistributedSampler(
+            self.dataset,
+            seed=seed,
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
         self.batch_sampler = DynamicBatchSampler(
             self.sampler,
             self.aspect_ratio_range,
             self.image_num_range,
             seed=seed,
-            max_img_per_gpu=max_img_per_gpu
+            max_img_per_gpu=max_img_per_gpu,
+            deterministic=not shuffle,
+            fix_img_num=fix_img_num,
+            fix_aspect_ratio=fix_aspect_ratio,
         )
 
     def get_loader(self, epoch):
@@ -101,13 +120,18 @@ class DynamicBatchSampler(Sampler):
     for each sample. Batches within a sample share the same aspect ratio and image number.
     """
 
-    def __init__(self,
-                 sampler,
-                 aspect_ratio_range,
-                 image_num_range,
-                 epoch=0,
-                 seed=42,
-                 max_img_per_gpu=48):
+    def __init__(
+        self,
+        sampler,
+        aspect_ratio_range,
+        image_num_range,
+        epoch=0,
+        seed=42,
+        max_img_per_gpu=48,
+        deterministic: bool = False,
+        fix_img_num: int = -1,
+        fix_aspect_ratio: float = -1.0,
+    ):
         """
         Initializes the dynamic batch sampler.
 
@@ -142,6 +166,9 @@ class DynamicBatchSampler(Sampler):
 
         # Maximum image number per GPU
         self.max_img_per_gpu = max_img_per_gpu
+        self.deterministic = deterministic
+        self.fix_img_num = fix_img_num
+        self.fix_aspect_ratio = fix_aspect_ratio
 
         # Set the epoch for the sampler
         self.set_epoch(epoch)
@@ -169,7 +196,10 @@ class DynamicBatchSampler(Sampler):
             Iterator yielding batches of indices with associated parameters.
         """
         sampler_iterator = iter(self.sampler)
-        if self.max_img_per_gpu == 96:
+        if self.deterministic:
+            # Val / eval: keep tail batches so every rank finishes the same step count.
+            drop_threshold = 0
+        elif self.max_img_per_gpu == 96:
             drop_threshold = 2
         elif self.max_img_per_gpu == 48:
             drop_threshold = 0
@@ -177,15 +207,36 @@ class DynamicBatchSampler(Sampler):
             drop_threshold = 0
         elif self.max_img_per_gpu == 192:
             drop_threshold = 4
+        elif self.max_img_per_gpu <= 8:
+            drop_threshold = 0
         else:
-            # print("Invalid max_img_per_gpu value")
             drop_threshold = 12
 
         while True:
             try:
-                # Sample synchronized image count and aspect ratio.
-                random_image_num = int(self.np_rng.choice(self.possible_nums, p=self.normalized_weights))
-                random_aspect_ratio = round(self.rng.uniform(self.aspect_ratio_range[0], self.aspect_ratio_range[1]), 2)
+                if self.deterministic:
+                    if self.fix_img_num > 0:
+                        random_image_num = int(self.fix_img_num)
+                    else:
+                        random_image_num = int(self.image_num_range[0])
+                    if self.fix_aspect_ratio > 0:
+                        random_aspect_ratio = round(float(self.fix_aspect_ratio), 2)
+                    else:
+                        random_aspect_ratio = round(
+                            0.5
+                            * (self.aspect_ratio_range[0] + self.aspect_ratio_range[1]),
+                            2,
+                        )
+                else:
+                    random_image_num = int(
+                        self.np_rng.choice(self.possible_nums, p=self.normalized_weights)
+                    )
+                    random_aspect_ratio = round(
+                        self.rng.uniform(
+                            self.aspect_ratio_range[0], self.aspect_ratio_range[1]
+                        ),
+                        2,
+                    )
 
                 # Update sampler parameters
                 self.sampler.update_parameters(

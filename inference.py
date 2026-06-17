@@ -326,20 +326,20 @@ def main(args: argparse.Namespace) -> None:
     # ── collect inputs ────────────────────────────────────────────────────
     image_paths = collect_images(args.image_dir)
     mask_paths  = collect_masks(args.mask_dir, image_paths)
-    S = len(image_paths)
+    S = len(image_paths) # 图片数量
     print(f"[pipeline] {S} image(s) found.")
     if mask_paths is not None:
-        n_masks = sum(1 for m in mask_paths if m is not None)
+        n_masks = sum(1 for m in mask_paths if m is not None) # 掩码数量
         print(f"[pipeline] {n_masks}/{S} mask(s) matched.")
 
     # ── model ─────────────────────────────────────────────────────────────
-    model = load_model(args.config, args.checkpoint, device)
+    model = load_model(args.config, args.checkpoint, device) # 加载模型
     model.eval().to(device)
     print(f"[pipeline] Model ready on {device}.")
     print(f"[pipeline] Fixed input resolution: H={_INPUT_H}, W={_INPUT_W}")
 
     # ── inference ─────────────────────────────────────────────────────────
-    preds = run_inference(model, image_paths, device)
+    preds = run_inference(model, image_paths, device) # 固定到518x1036
 
     # ── unpack predictions ────────────────────────────────────────────────
     # After squeeze, expected shapes:
@@ -469,7 +469,7 @@ def main(args: argparse.Namespace) -> None:
             all_rgb.append(rgb_w)
 
     # ── merged point cloud ────────────────────────────────────────────────
-    if all_xyz:
+    if all_xyz: # 合并点云
         merged_xyz = np.concatenate(all_xyz, axis=0)
         merged_rgb = np.concatenate(all_rgb, axis=0)
         save_ply(os.path.join(merged_dir, "merged.ply"), merged_xyz, merged_rgb)

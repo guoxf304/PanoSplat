@@ -49,7 +49,7 @@ class GradientClipper:
         """
         # First, collect all parameters that should be clipped based on module names
         params_to_clip_by_config = []
-        all_clipped_params = set()
+        all_clipped_param_ids: set[int] = set()
         
         for config in self.configs:
             current_config_params = []
@@ -58,20 +58,38 @@ class GradientClipper:
                     for module_name in config['module_names']:
                         if module_name in name:
                             current_config_params.append(param)
-                            all_clipped_params.add(param)
+                            all_clipped_param_ids.add(id(param))
                             break
             params_to_clip_by_config.append((config, current_config_params))
 
-        # Check for remaining parameters
+        # Check for remaining parameters (identity-based; Parameter `==` compares values).
         remaining_params = []
         for name, param in model.named_parameters():
-            if param.requires_grad and param not in all_clipped_params:
+            if param.requires_grad and id(param) not in all_clipped_param_ids:
                 remaining_params.append(param)
 
         if len(remaining_params) > 0:
-            print(f"Found {len(remaining_params)} parameters that won't be clipped")
-            print(remaining_params)
-            raise ValueError("Some parameters are not configured for gradient clipping")
+            remaining_ids = {id(p) for p in remaining_params}
+            remaining_names = [
+                n for n, p in model.named_parameters()
+                if p.requires_grad and id(p) in remaining_ids
+            ]
+            print(
+                f"Found {len(remaining_params)} parameters that won't be clipped: "
+                f"{remaining_names[:8]}{'...' if len(remaining_names) > 8 else ''}"
+            )
+            # Fallback: clip any unmatched trainable params together.
+            if remaining_params:
+                params_to_clip_by_config.append(
+                    (
+                        {
+                            "module_names": ["_remaining_trainable_"],
+                            "max_norm": self.configs[0]["max_norm"] if self.configs else 1.0,
+                            "norm_type": self.configs[0]["norm_type"] if self.configs else 2,
+                        },
+                        remaining_params,
+                    )
+                )
         
         # Store the computed parameters
         self.params_to_clip_by_config = params_to_clip_by_config
